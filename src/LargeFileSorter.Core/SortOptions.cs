@@ -16,13 +16,16 @@ public sealed class SortOptions
 
     /// <summary>
     /// Directory for temporary chunk files. Uses system temp if not specified.
+    /// Point to a fast SSD for best performance.
     /// </summary>
     public string? TempDirectory { get; init; }
 
     /// <summary>
-    /// I/O buffer size for readers and writers.
+    /// I/O buffer size for file streams and writers.
+    /// Larger values reduce syscall overhead for sequential I/O.
+    /// Default: 1 MB (optimal for modern SSDs with sequential access).
     /// </summary>
-    public int BufferSize { get; init; } = 64 * 1024;
+    public int BufferSize { get; init; } = 1024 * 1024;
 
     private static long GetDefaultChunkMemory()
     {
