@@ -9,7 +9,15 @@ internal static class ChunkSorter
 {
     private const int ParallelThreshold = 50_000;
 
-    public static void Sort(LineEntry[] data, int count)
+    /// <param name="data">Array of entries to sort.</param>
+    /// <param name="count">Number of valid entries in the array.</param>
+    /// <param name="maxParallelism">
+    ///   Maximum number of parallel segments to sort simultaneously.
+    ///   Defaults to <see cref="Environment.ProcessorCount"/> when &lt;= 0.
+    ///   Pass a lower value when multiple sort workers run concurrently
+    ///   to avoid over-subscribing CPU cores.
+    /// </param>
+    public static void Sort(LineEntry[] data, int count, int maxParallelism = -1)
     {
         if (count < ParallelThreshold)
         {
@@ -17,10 +25,12 @@ internal static class ChunkSorter
             return;
         }
 
-        var segCount = Math.Clamp(Environment.ProcessorCount, 2, 8);
+        var segCount = maxParallelism > 0
+            ? Math.Clamp(maxParallelism, 2, 8)
+            : Math.Clamp(Environment.ProcessorCount, 2, 8);
         var segSize = count / segCount;
 
-        Parallel.For(0, segCount, i =>
+        Parallel.For(0, segCount, new ParallelOptions { MaxDegreeOfParallelism = segCount }, i =>
         {
             var start = i * segSize;
             var len = (i == segCount - 1) ? count - start : segSize;
