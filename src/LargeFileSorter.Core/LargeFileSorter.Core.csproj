@@ -4,4 +4,8 @@
     <RootNamespace>LargeFileSorter.Core</RootNamespace>
   </PropertyGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="LargeFileSorter.Tests" />
+  </ItemGroup>
+
 </Project>
