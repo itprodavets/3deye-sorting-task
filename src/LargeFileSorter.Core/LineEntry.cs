@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+
 namespace LargeFileSorter.Core;
 
 /// <summary>
@@ -23,6 +25,7 @@ public readonly struct LineEntry : IComparable<LineEntry>, IEquatable<LineEntry>
         _sortKey = ComputeSortKey(text);
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int CompareTo(LineEntry other)
     {
         // Fast path: most entries differ in the first 4 chars

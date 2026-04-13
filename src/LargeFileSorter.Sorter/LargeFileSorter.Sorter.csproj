@@ -3,6 +3,13 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <RootNamespace>LargeFileSorter.Sorter</RootNamespace>
+    <!-- Server GC: one heap per logical core, parallel collection threads -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <!-- Background Gen2 collections — don't block application threads -->
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <!-- Keep committed memory after GC instead of decommitting, so the next
+         chunk allocation reuses the same pages without a kernel call -->
+    <RetainVMGarbageCollection>true</RetainVMGarbageCollection>
   </PropertyGroup>
 
   <ItemGroup>
