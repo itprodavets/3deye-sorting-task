@@ -9,7 +9,8 @@ if (args.Length < 2)
     Console.WriteLine("  --memory <size>       Max memory per chunk, e.g. 512MB, 1GB (default: auto)");
     Console.WriteLine("  --merge-width <num>   Max files per merge pass (default: 64)");
     Console.WriteLine("  --temp-dir <path>     Directory for temporary files");
-    Console.WriteLine("  --buffer <size>       I/O buffer size, e.g. 64KB, 1MB (default: 64KB)");
+    Console.WriteLine("  --buffer <size>       I/O buffer size, e.g. 1MB, 4MB (default: auto)");
+    Console.WriteLine("  --workers <num>       Concurrent sort workers (default: auto)");
     return 1;
 }
 
@@ -33,7 +34,8 @@ for (var i = 2; i < args.Length - 1; i++)
                 MaxMemoryPerChunk = ParseSize(args[++i]),
                 MergeWidth = options.MergeWidth,
                 TempDirectory = options.TempDirectory,
-                BufferSize = options.BufferSize
+                BufferSize = options.BufferSize,
+                SortWorkers = options.SortWorkers
             };
             break;
         case "--merge-width":
@@ -42,7 +44,8 @@ for (var i = 2; i < args.Length - 1; i++)
                 MaxMemoryPerChunk = options.MaxMemoryPerChunk,
                 MergeWidth = int.Parse(args[++i]),
                 TempDirectory = options.TempDirectory,
-                BufferSize = options.BufferSize
+                BufferSize = options.BufferSize,
+                SortWorkers = options.SortWorkers
             };
             break;
         case "--temp-dir":
@@ -51,7 +54,8 @@ for (var i = 2; i < args.Length - 1; i++)
                 MaxMemoryPerChunk = options.MaxMemoryPerChunk,
                 MergeWidth = options.MergeWidth,
                 TempDirectory = args[++i],
-                BufferSize = options.BufferSize
+                BufferSize = options.BufferSize,
+                SortWorkers = options.SortWorkers
             };
             break;
         case "--buffer":
@@ -60,16 +64,33 @@ for (var i = 2; i < args.Length - 1; i++)
                 MaxMemoryPerChunk = options.MaxMemoryPerChunk,
                 MergeWidth = options.MergeWidth,
                 TempDirectory = options.TempDirectory,
-                BufferSize = (int)ParseSize(args[++i])
+                BufferSize = (int)ParseSize(args[++i]),
+                SortWorkers = options.SortWorkers
+            };
+            break;
+        case "--workers":
+            options = new SortOptions
+            {
+                MaxMemoryPerChunk = options.MaxMemoryPerChunk,
+                MergeWidth = options.MergeWidth,
+                TempDirectory = options.TempDirectory,
+                BufferSize = options.BufferSize,
+                SortWorkers = int.Parse(args[++i])
             };
             break;
     }
 }
 
+var hw = SortOptions.DetectHardware();
+Console.WriteLine($"Hardware: {hw}");
+Console.WriteLine();
+
 var inputInfo = new FileInfo(inputPath);
-Console.WriteLine($"Input:  {inputPath} ({FormatSize(inputInfo.Length)})");
+Console.WriteLine($"Input:  {inputPath} ({SizeFormatter.Format(inputInfo.Length)})");
 Console.WriteLine($"Output: {outputPath}");
-Console.WriteLine($"Chunk memory budget: {FormatSize(options.MaxMemoryPerChunk)}");
+Console.WriteLine($"Chunk memory budget: {SizeFormatter.Format(options.MaxMemoryPerChunk)}");
+Console.WriteLine($"I/O buffer: {SizeFormatter.Format(options.BufferSize)}");
+Console.WriteLine($"Sort workers: {options.SortWorkers}");
 Console.WriteLine($"Merge width: {options.MergeWidth}");
 Console.WriteLine();
 
@@ -101,7 +122,7 @@ sw.Stop();
 var outputInfo = new FileInfo(outputPath);
 Console.WriteLine();
 Console.WriteLine($"Completed in {sw.Elapsed:hh\\:mm\\:ss\\.fff}");
-Console.WriteLine($"Output size: {FormatSize(outputInfo.Length)}");
+Console.WriteLine($"Output size: {SizeFormatter.Format(outputInfo.Length)}");
 
 return 0;
 
@@ -119,10 +140,3 @@ static long ParseSize(string input)
     return long.Parse(input);
 }
 
-static string FormatSize(long bytes) => bytes switch
-{
-    >= 1024L * 1024 * 1024 => $"{bytes / (1024.0 * 1024 * 1024):F2} GB",
-    >= 1024L * 1024 => $"{bytes / (1024.0 * 1024):F2} MB",
-    >= 1024L => $"{bytes / 1024.0:F2} KB",
-    _ => $"{bytes} B"
-};
