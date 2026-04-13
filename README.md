@@ -73,7 +73,8 @@ dotnet run --project src/LargeFileSorter.Sorter -- input.txt sorted.txt \
     --memory 1GB \
     --merge-width 32 \
     --temp-dir /mnt/fast-ssd/tmp \
-    --buffer 4MB
+    --buffer 4MB \
+    --workers 2
 ```
 
 ### Run tests
@@ -90,7 +91,7 @@ dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release
 
 ## Performance Results
 
-Measured on Apple M1 Pro (10 cores), 16 GB RAM, macOS, .NET 10.
+Measured on Apple M4 Max (16 cores), 64 GB RAM, macOS, .NET 10.
 
 ### Throughput
 
@@ -113,7 +114,7 @@ Measured on Apple M1 Pro (10 cores), 16 GB RAM, macOS, .NET 10.
 
 | Resource | Behavior |
 |----------|----------|
-| Peak memory | ~25% of available RAM (auto-tuned, capped at 2 GB per chunk) |
+| Peak memory | ~25% of available RAM (auto-tuned, capped per machine — up to 8 GB per chunk on 64 GB+) |
 | Temp disk | ~1x input size during sort (binary chunks are slightly larger than text) |
 | CPU | N sort workers (1–4) with parallel intra-chunk sort, avoids oversubscription |
 | File handles | Bounded by MergeWidth (default: 64); multi-level merge if exceeded |
@@ -154,21 +155,39 @@ The sorter uses a two-phase **external merge sort**:
 | ThreadPool pre-warm | SetMinThreads = ProcessorCount to avoid injection stall |
 
 ### Memory Management
-- Chunk memory budget auto-tunes to ~25% of available RAM (capped at 2 GB).
+- Chunk memory budget auto-tunes to ~25% of available RAM (cap scales with machine: 1 GB on small, up to 8 GB on 64 GB+).
 - Custom `ArrayPool<LineEntry>` (32M max) reuses chunk arrays across iterations — the default `Shared` pool only handles up to ~1M elements.
 - Bounded channel (capacity = worker count) limits in-flight chunks, keeping peak memory predictable.
 - String pooling within chunks deduplicates repeated text values; memory estimation counts string bytes only once per unique text.
-- PipeReader reads large blocks (1 MB default) with zero per-line allocation for the full input line.
+- PipeReader reads large blocks (auto-scaled: 1–16 MB) with zero per-line allocation for the full input line.
 - Binary chunk format avoids text re-parsing during merge — only the final output writes text.
 - All output uses `UTF8Encoding(false)` — no BOM in generated files.
+
+### Hardware Auto-Tuning
+
+All key parameters scale automatically to the machine's available RAM at startup. No manual tuning is needed for typical workloads — the sorter prints its detected hardware profile before starting:
+
+```
+Hardware: RAM: 64.0 GB, Cores: 16, Chunk budget: 8.0 GB, I/O buffer: 16 MB, Sort workers: 4
+```
+
+| Parameter | < 8 GB RAM | 8 GB | 16 GB | 32 GB | 64 GB+ |
+|-----------|-----------|------|-------|-------|--------|
+| Chunk memory cap | 1 GB | 2 GB | 2 GB | 4 GB | 8 GB |
+| I/O buffer | 1 MB | 2 MB | 4 MB | 8 MB | 16 MB |
+
+Larger I/O buffers reduce syscall overhead on NVMe SSDs (peak sequential throughput at 4–16 MB). Larger chunks reduce the number of merge passes, directly improving total sort time.
+
+Disk space is validated before sorting starts — the sorter requires at least 1.2× the input file size as free space in the temp directory.
 
 ### Performance Tuning
 
 | Parameter       | Flag             | Default | Effect                                        |
 |-----------------|------------------|---------|-----------------------------------------------|
-| Chunk memory    | `--memory`       | auto (~25% RAM) | Larger = fewer chunks, faster merge phase     |
+| Chunk memory    | `--memory`       | auto (~25% RAM, capped) | Larger = fewer chunks, faster merge phase     |
 | Merge width     | `--merge-width`  | 64      | Wider = fewer merge levels, more file handles |
-| Buffer size     | `--buffer`       | 1 MB    | Larger = fewer I/O syscalls                   |
+| Buffer size     | `--buffer`       | auto (1–16 MB) | Larger = fewer I/O syscalls                   |
+| Sort workers    | `--workers`      | auto (1–4)  | More workers = higher CPU usage, faster sort  |
 | Temp directory  | `--temp-dir`     | system temp | Point to fast SSD for temp files              |
 
 ## Algorithm Comparison
@@ -214,7 +233,9 @@ PipeReader + binary chunks + concurrent pipeline + parallel sort + sort key + GC
 | Buffered binary merge (8K records/batch) — fewer syscalls | |
 | String deduplication — less memory for repeated text | |
 | Server GC + SustainedLowLatency + RetainVM — minimal pauses | |
-| Auto-tuned chunk size (~25% of RAM, capped at 2 GB) | |
+| Auto-tuned chunk size (~25% of RAM, capped per machine) | |
+| Auto-scaled I/O buffers (1–16 MB based on available RAM) | |
+| Disk space validation before sort starts | |
 
 ### Why external merge sort?
 
