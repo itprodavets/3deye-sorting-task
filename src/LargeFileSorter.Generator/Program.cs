@@ -45,11 +45,11 @@ var options = new GeneratorOptions
 };
 
 Console.WriteLine($"Generating file: {outputPath}");
-Console.WriteLine($"Target size: {FormatSize(targetSize)}");
+Console.WriteLine($"Target size: {SizeFormatter.Format(targetSize)}");
 Console.WriteLine($"Unique phrases: {options.UniquePhraseCount}");
 
 var progress = new Progress<long>(bytes =>
-    Console.Write($"\rProgress: {FormatSize(bytes)} / {FormatSize(targetSize)}    "));
+    Console.Write($"\rProgress: {SizeFormatter.Format(bytes)} / {SizeFormatter.Format(targetSize)}    "));
 
 var sw = Stopwatch.StartNew();
 var generator = new FileGenerator(options);
@@ -58,7 +58,7 @@ sw.Stop();
 
 var fileInfo = new FileInfo(outputPath);
 Console.WriteLine();
-Console.WriteLine($"Done in {sw.Elapsed:hh\\:mm\\:ss\\.fff}. Actual size: {FormatSize(fileInfo.Length)}");
+Console.WriteLine($"Done in {sw.Elapsed:hh\\:mm\\:ss\\.fff}. Actual size: {SizeFormatter.Format(fileInfo.Length)}");
 
 return 0;
 
@@ -76,10 +76,3 @@ static long ParseSize(string input)
     return long.Parse(input);
 }
 
-static string FormatSize(long bytes) => bytes switch
-{
-    >= 1024L * 1024 * 1024 => $"{bytes / (1024.0 * 1024 * 1024):F2} GB",
-    >= 1024L * 1024 => $"{bytes / (1024.0 * 1024):F2} MB",
-    >= 1024L => $"{bytes / 1024.0:F2} KB",
-    _ => $"{bytes} B"
-};

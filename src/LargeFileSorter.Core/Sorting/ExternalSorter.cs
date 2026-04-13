@@ -42,6 +42,8 @@ public sealed class ExternalSorter : IFileSorter
             $"filesort_{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
 
+        ValidateDiskSpace(inputPath, tempDir);
+
         // Pre-warm the thread pool so Parallel.For inside sort workers
         // doesn't stall waiting for thread injection.
         EnsureMinThreads();
@@ -105,9 +107,7 @@ public sealed class ExternalSorter : IFileSorter
     private async Task<List<string>> SplitAndSortAsync(
         string inputPath, string tempDir, IProgress<string>? progress, CancellationToken ct)
     {
-        // Scale sort workers to available cores: each worker runs sort + binary write
-        // concurrently, overlapping CPU-heavy sort with I/O-heavy write.
-        var workerCount = Math.Clamp(Environment.ProcessorCount / 2, 1, 4);
+        var workerCount = _options.SortWorkers;
         var sortParallelism = Math.Max(2, Environment.ProcessorCount / workerCount);
 
         var channel = Channel.CreateBounded<ChunkPayload>(
@@ -356,6 +356,27 @@ public sealed class ExternalSorter : IFileSorter
 
     private int EstimateChunkCapacity()
         => (int)Math.Min(_options.MaxMemoryPerChunk / 96, int.MaxValue / 2);
+
+    /// <summary>
+    /// Checks that the temp directory has enough free disk space before starting.
+    /// Binary chunks are slightly larger than the original text, so we require
+    /// at least 1.2× the input file size as headroom.
+    /// </summary>
+    private static void ValidateDiskSpace(string inputPath, string tempDir)
+    {
+        var inputSize = new FileInfo(inputPath).Length;
+        var requiredSpace = (long)(inputSize * 1.2);
+
+        var driveInfo = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(tempDir))!);
+        if (driveInfo.IsReady && driveInfo.AvailableFreeSpace < requiredSpace)
+        {
+            throw new IOException(
+                $"Insufficient disk space in temp directory. " +
+                $"Required: {SizeFormatter.Format(requiredSpace)}, " +
+                $"Available: {SizeFormatter.Format(driveInfo.AvailableFreeSpace)}. " +
+                $"Use --temp-dir to point to a drive with more space.");
+        }
+    }
 
     /// <summary>
     /// Pre-warms the thread pool so <see cref="Parallel.For"/> and
