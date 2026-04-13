@@ -21,7 +21,7 @@ internal sealed class BinaryChunkReader : IChunkReader
     {
         var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
             FileShare.Read, ioBufferSize, FileOptions.SequentialScan);
-        _reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: false);
+        _reader = new BinaryReader(stream, new UTF8Encoding(false), leaveOpen: false);
         Refill();
     }
 
