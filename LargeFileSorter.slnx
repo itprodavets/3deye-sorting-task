@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/benchmarks/">
+    <Project Path="benchmarks/LargeFileSorter.Benchmarks/LargeFileSorter.Benchmarks.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/LargeFileSorter.Core/LargeFileSorter.Core.csproj" />
+    <Project Path="src/LargeFileSorter.Generator/LargeFileSorter.Generator.csproj" />
+    <Project Path="src/LargeFileSorter.Sorter/LargeFileSorter.Sorter.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/LargeFileSorter.Tests/LargeFileSorter.Tests.csproj" />
+  </Folder>
+</Solution>
