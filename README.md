@@ -105,6 +105,59 @@ The sorter uses a two-phase **external merge sort**:
 | Buffer size     | `--buffer`       | Larger = fewer I/O syscalls                   |
 | Temp directory  | `--temp-dir`     | Point to fast SSD for temp files              |
 
+## Algorithm Comparison
+
+The benchmark suite (`dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release`) compares four approaches to justify the design:
+
+### 1. Naive In-Memory Sort
+
+Read entire file → `Array.Sort` → write output.
+
+| Pros | Cons |
+|------|------|
+| Fastest for small files (no chunk overhead) | O(file_size) memory — **impossible for ~100 GB** |
+| Simplest implementation | `OutOfMemoryException` on large inputs |
+| Single pass, no temp files | No concurrency — CPU idle during I/O |
+| | GC pressure from large arrays on LOH |
+
+### 2. Sequential External Sort
+
+Read chunks → sort one at a time → write temp files → merge.
+
+| Pros | Cons |
+|------|------|
+| Handles files larger than RAM | CPU idle while reading/writing (no pipelining) |
+| Predictable, simple control flow | Single-threaded sort — wastes multi-core CPUs |
+| Bounded memory usage | Per-line I/O in merge — no batching |
+| | `ToString()` allocation per line on writes |
+| | No array pooling — LOH allocation per chunk |
+
+### 3. Optimized External Sort (our solution)
+
+Concurrent pipeline with parallel sort, ArrayPool, buffered merge.
+
+| Pros | Cons |
+|------|------|
+| Handles 100 GB+ files within bounded memory | More complex implementation |
+| Concurrent pipeline — disk I/O overlaps CPU | Slight overhead for very small files |
+| Parallel merge sort within chunks (multi-core) | |
+| ArrayPool — no repeated LOH allocations | |
+| Buffered merge (8K lines/batch) — fewer syscalls | |
+| Direct formatting — zero per-line allocations | |
+| String deduplication — less memory for repeated text | |
+| Auto-tuned chunk size (~25% of RAM, capped at 2 GB) | |
+
+### Why external merge sort?
+
+For a ~100 GB file that does not fit in memory, external merge sort is the standard approach:
+
+- **Merge sort** is naturally suited for sequential disk access (reads and writes are linear, not random).
+- **K-way merge** with `PriorityQueue` is O(N log K) where K = number of chunks — nearly linear in total lines.
+- Alternatives like **external quicksort** require random access patterns that perform poorly on disk.
+- **External radix sort** could work but depends on the data distribution and is harder to generalize for variable-length string keys.
+
+The concurrent pipeline and parallel chunk sorting are orthogonal improvements that maximize hardware utilization without changing the algorithmic complexity.
+
 ## License
 
 MIT
