@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.IO.Pipelines;
 using System.Text;
 using System.Threading.Channels;
 
@@ -8,17 +9,18 @@ namespace LargeFileSorter.Core;
 /// External merge sort optimized for very large files (~100 GB+).
 ///
 /// Phase 1 (split &amp; sort):
-///   A reader fills chunks from the input file using sync I/O (avoids per-line
-///   async state machine overhead). Filled chunks are sent via a bounded channel
-///   to a sort worker that sorts in parallel and writes to temp files.
-///   The reader and sort worker run concurrently — overlapping disk I/O and CPU.
-///   ArrayPool is used to reuse chunk arrays across iterations.
+///   PipeReader reads the input in large blocks — no per-line string allocation.
+///   Lines are parsed directly from UTF-8 bytes (only the Text part becomes a string).
+///   Filled chunks are sent via a bounded Channel to a sort worker.
+///   Sort uses parallel segment sorting + k-way merge within each chunk.
+///   Sorted chunks are written in binary format (BinaryWriter) to avoid
+///   re-parsing text during the merge phase.
+///   ArrayPool reuses chunk arrays across iterations.
 ///
 /// Phase 2 (k-way merge):
-///   Sorted chunks are merged using a PriorityQueue-based k-way merge.
-///   Each chunk is wrapped in a BufferedChunkReader that pre-fetches batches
-///   of lines, reducing per-line I/O overhead. Multi-level merge keeps
-///   file handle count within bounds for very large inputs.
+///   Binary chunk readers pre-fetch batches of records (no text parsing).
+///   PriorityQueue-based k-way merge with multi-level support.
+///   Output is written as text (the required format).
 /// </summary>
 public sealed class ExternalSorter
 {
@@ -53,8 +55,8 @@ public sealed class ExternalSorter
 
             if (chunkFiles.Count == 1)
             {
-                File.Move(chunkFiles[0], outputPath, overwrite: true);
-                progress?.Report("Done (single chunk, no merge needed).");
+                MergeSingleChunkToText(chunkFiles[0], outputPath);
+                progress?.Report("Done (single chunk).");
                 return;
             }
 
@@ -69,30 +71,24 @@ public sealed class ExternalSorter
     }
 
     // -------------------------------------------------------------------
-    //  Phase 1 — concurrent read → sort → write pipeline
+    //  Phase 1 — PipeReader → parse UTF-8 → Channel → parallel sort → binary write
     // -------------------------------------------------------------------
 
     private async Task<List<string>> SplitAndSortAsync(
         string inputPath, string tempDir, IProgress<string>? progress, CancellationToken ct)
     {
-        // Bounded channel provides backpressure: if the sort worker is busy,
-        // the reader blocks — preventing unbounded memory growth.
         var channel = Channel.CreateBounded<ChunkPayload>(
             new BoundedChannelOptions(1) { SingleWriter = true });
 
         var chunkPaths = new List<string>();
         var pathLock = new object();
 
-        // Producer: reads input file sequentially, fills chunks, pushes to channel.
-        var readerTask = Task.Run(() =>
+        var readerTask = Task.Run(async () =>
         {
-            ReadInputIntoChunks(inputPath, channel.Writer, progress, ct);
+            await ReadInputWithPipeReaderAsync(inputPath, channel.Writer, progress, ct);
             channel.Writer.Complete();
         }, ct);
 
-        // Consumer: receives chunks, sorts with parallel merge sort, writes to disk.
-        // Single worker keeps memory bounded (at most ~3 chunks in flight).
-        // Parallelism comes from Parallel.For inside SortChunk.
         var sortTask = Task.Run(async () =>
         {
             await foreach (var payload in channel.Reader.ReadAllAsync(ct))
@@ -101,8 +97,8 @@ public sealed class ExternalSorter
                 {
                     SortChunk(payload.Data, payload.Count);
 
-                    var path = Path.Combine(tempDir, $"chunk_{payload.Index:D6}.txt");
-                    WriteChunkFile(path, payload.Data, payload.Count);
+                    var path = Path.Combine(tempDir, $"chunk_{payload.Index:D6}.bin");
+                    WriteChunkBinary(path, payload.Data, payload.Count);
 
                     lock (pathLock)
                         chunkPaths.Add(path);
@@ -121,7 +117,7 @@ public sealed class ExternalSorter
         return chunkPaths;
     }
 
-    private void ReadInputIntoChunks(
+    private async Task ReadInputWithPipeReaderAsync(
         string inputPath, ChannelWriter<ChunkPayload> writer,
         IProgress<string>? progress, CancellationToken ct)
     {
@@ -134,60 +130,110 @@ public sealed class ExternalSorter
         long estimatedBytes = 0;
         var chunkIndex = 0;
 
-        // Sync ReadLine avoids allocating an async state machine per line.
-        // With millions of lines per chunk, this overhead adds up significantly.
-        using var stream = new FileStream(inputPath, FileMode.Open, FileAccess.Read,
-            FileShare.Read, _options.BufferSize, FileOptions.SequentialScan);
-        using var reader = new StreamReader(stream, Encoding.UTF8, true, _options.BufferSize);
+        await using var stream = new FileStream(inputPath, FileMode.Open, FileAccess.Read,
+            FileShare.Read, _options.BufferSize, FileOptions.SequentialScan | FileOptions.Asynchronous);
 
-        while (reader.ReadLine() is { } line)
+        var pipe = PipeReader.Create(stream, new StreamPipeReaderOptions(
+            bufferSize: _options.BufferSize,
+            minimumReadSize: _options.BufferSize / 4));
+
+        var isFirstRead = true;
+
+        try
         {
-            ct.ThrowIfCancellationRequested();
-
-            var entry = LineParser.Parse(line);
-
-            // Deduplicate text references within the chunk.
-            // The task guarantees duplicate strings — pooling avoids storing
-            // multiple copies of the same text in memory.
-            if (stringPool.TryGetValue(entry.Text, out var existing))
-                entry = new LineEntry(entry.Number, existing);
-            else
-                stringPool[entry.Text] = entry.Text;
-
-            // Grow array if needed (ArrayPool may return larger than requested)
-            if (count >= array.Length)
+            while (true)
             {
-                var bigger = pool.Rent(array.Length * 2);
-                array.AsSpan(0, count).CopyTo(bigger);
-                pool.Return(array, clearArray: true);
-                array = bigger;
+                var readResult = await pipe.ReadAsync(ct);
+                var buffer = readResult.Buffer;
+
+                // Skip UTF-8 BOM if present at the start of the file
+                if (isFirstRead && buffer.Length >= 3)
+                {
+                    ReadOnlySpan<byte> bom = [0xEF, 0xBB, 0xBF];
+                    var first3 = buffer.Slice(0, 3);
+                    if (first3.IsSingleSegment
+                            ? first3.FirstSpan.SequenceEqual(bom)
+                            : CopyAndCheck(first3, bom))
+                    {
+                        buffer = buffer.Slice(3);
+                    }
+                    isFirstRead = false;
+                }
+
+                while (TryReadLine(ref buffer, out var lineSeq))
+                {
+                    ct.ThrowIfCancellationRequested();
+
+                    var entry = ParseLineFromSequence(lineSeq);
+
+                    if (stringPool.TryGetValue(entry.Text, out var existing))
+                        entry = new LineEntry(entry.Number, existing);
+                    else
+                        stringPool[entry.Text] = entry.Text;
+
+                    if (count >= array.Length)
+                    {
+                        var bigger = pool.Rent(array.Length * 2);
+                        array.AsSpan(0, count).CopyTo(bigger);
+                        pool.Return(array, clearArray: true);
+                        array = bigger;
+                    }
+
+                    array[count++] = entry;
+                    estimatedBytes += 32 + 40 + entry.Text.Length * 2;
+
+                    if (estimatedBytes >= _options.MaxMemoryPerChunk)
+                    {
+                        var idx = chunkIndex++;
+                        progress?.Report($"  chunk {idx}: {count:N0} lines queued");
+                        await writer.WriteAsync(new ChunkPayload(array, count, idx), ct);
+
+                        capacity = EstimateChunkCapacity();
+                        array = pool.Rent(capacity);
+                        count = 0;
+                        estimatedBytes = 0;
+                        stringPool.Clear();
+                    }
+                }
+
+                if (readResult.IsCompleted)
+                {
+                    // Handle last line (no trailing newline) BEFORE AdvanceTo —
+                    // the pipe may reclaim buffer memory after AdvanceTo.
+                    if (!buffer.IsEmpty)
+                    {
+                        var entry = ParseLineFromSequence(buffer);
+                        if (stringPool.TryGetValue(entry.Text, out var existing))
+                            entry = new LineEntry(entry.Number, existing);
+                        else
+                            stringPool[entry.Text] = entry.Text;
+
+                        if (count >= array.Length)
+                        {
+                            var bigger = pool.Rent(array.Length * 2);
+                            array.AsSpan(0, count).CopyTo(bigger);
+                            pool.Return(array, clearArray: true);
+                            array = bigger;
+                        }
+                        array[count++] = entry;
+                    }
+
+                    pipe.AdvanceTo(buffer.End);
+                    break;
+                }
+
+                pipe.AdvanceTo(buffer.Start, buffer.End);
             }
-
-            array[count++] = entry;
-            estimatedBytes += 24 + 40 + entry.Text.Length * 2;
-
-            if (estimatedBytes >= _options.MaxMemoryPerChunk)
-            {
-                var idx = chunkIndex++;
-                progress?.Report($"  chunk {idx}: {count:N0} lines queued");
-
-                // Blocks if channel is full — backpressure from the sort worker
-                writer.WriteAsync(new ChunkPayload(array, count, idx), ct)
-                    .AsTask().GetAwaiter().GetResult();
-
-                capacity = EstimateChunkCapacity();
-                array = pool.Rent(capacity);
-                count = 0;
-                estimatedBytes = 0;
-                stringPool.Clear();
-            }
+        }
+        finally
+        {
+            await pipe.CompleteAsync();
         }
 
         if (count > 0)
         {
             progress?.Report($"  chunk {chunkIndex}: {count:N0} lines (final)");
-            writer.WriteAsync(new ChunkPayload(array, count, chunkIndex), ct)
-                .AsTask().GetAwaiter().GetResult();
+            await writer.WriteAsync(new ChunkPayload(array, count, chunkIndex), ct);
         }
         else
         {
@@ -195,10 +241,61 @@ public sealed class ExternalSorter
         }
     }
 
-    /// <summary>
-    /// Sorts <paramref name="count"/> elements in <paramref name="data"/>.
-    /// For large chunks, sorts segments in parallel then merges them via a PriorityQueue.
-    /// </summary>
+    private static bool TryReadLine(ref ReadOnlySequence<byte> buffer, out ReadOnlySequence<byte> line)
+    {
+        var position = buffer.PositionOf((byte)'\n');
+        if (position == null)
+        {
+            line = default;
+            return false;
+        }
+
+        line = buffer.Slice(0, position.Value);
+        buffer = buffer.Slice(buffer.GetPosition(1, position.Value));
+        return true;
+    }
+
+    private static LineEntry ParseLineFromSequence(ReadOnlySequence<byte> lineSeq)
+    {
+        // Trim \r
+        if (lineSeq.Length > 0)
+        {
+            var last = lineSeq.Slice(lineSeq.Length - 1).FirstSpan[0];
+            if (last == (byte)'\r')
+                lineSeq = lineSeq.Slice(0, lineSeq.Length - 1);
+        }
+
+        if (lineSeq.Length == 0)
+            throw new FormatException("Empty line");
+
+        if (lineSeq.IsSingleSegment)
+            return LineParser.ParseUtf8(lineSeq.FirstSpan);
+
+        // Multi-segment (rare — only at buffer boundaries)
+        var length = (int)lineSeq.Length;
+        var rented = ArrayPool<byte>.Shared.Rent(length);
+        try
+        {
+            lineSeq.CopyTo(rented);
+            return LineParser.ParseUtf8(rented.AsSpan(0, length));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    private static bool CopyAndCheck(ReadOnlySequence<byte> seq, ReadOnlySpan<byte> expected)
+    {
+        Span<byte> tmp = stackalloc byte[(int)seq.Length];
+        seq.CopyTo(tmp);
+        return tmp.SequenceEqual(expected);
+    }
+
+    // -------------------------------------------------------------------
+    //  Parallel chunk sort
+    // -------------------------------------------------------------------
+
     private static void SortChunk(LineEntry[] data, int count)
     {
         const int parallelThreshold = 50_000;
@@ -212,7 +309,6 @@ public sealed class ExternalSorter
         var segCount = Math.Clamp(Environment.ProcessorCount, 2, 8);
         var segSize = count / segCount;
 
-        // Sort each segment on a separate thread
         Parallel.For(0, segCount, i =>
         {
             var start = i * segSize;
@@ -220,7 +316,6 @@ public sealed class ExternalSorter
             Array.Sort(data, start, len);
         });
 
-        // K-way merge the sorted segments into a temp array, then copy back
         MergeSortedSegments(data, count, segCount, segSize);
     }
 
@@ -243,7 +338,6 @@ public sealed class ExternalSorter
         {
             pq.TryDequeue(out var seg, out var entry);
             merged[idx++] = entry;
-
             positions[seg]++;
             if (positions[seg] < limits[seg])
                 pq.Enqueue(seg, data[positions[seg]]);
@@ -252,24 +346,49 @@ public sealed class ExternalSorter
         merged.AsSpan(0, count).CopyTo(data);
     }
 
-    /// <summary>
-    /// Writes a sorted chunk to disk using sync I/O with direct formatting
-    /// to avoid ToString() allocations on every line.
-    /// </summary>
-    private void WriteChunkFile(string path, LineEntry[] data, int count)
+    // -------------------------------------------------------------------
+    //  Binary chunk I/O
+    // -------------------------------------------------------------------
+
+    private static void WriteChunkBinary(string path, LineEntry[] data, int count)
     {
         using var stream = new FileStream(path, FileMode.Create, FileAccess.Write,
-            FileShare.None, _options.BufferSize, FileOptions.SequentialScan);
-        using var writer = new StreamWriter(stream, Encoding.UTF8, _options.BufferSize);
+            FileShare.None, 65536, FileOptions.SequentialScan);
+        using var bw = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: false);
 
         for (var i = 0; i < count; i++)
         {
-            WriteEntry(writer, in data[i]);
+            bw.Write(data[i].Number);
+            bw.Write(data[i].Text);
         }
     }
 
+    private void MergeSingleChunkToText(string binaryChunkPath, string outputPath)
+    {
+        using var inStream = new FileStream(binaryChunkPath, FileMode.Open, FileAccess.Read,
+            FileShare.Read, _options.BufferSize, FileOptions.SequentialScan);
+        using var br = new BinaryReader(inStream, Encoding.UTF8, leaveOpen: false);
+
+        using var outStream = new FileStream(outputPath, FileMode.Create, FileAccess.Write,
+            FileShare.None, _options.BufferSize, FileOptions.SequentialScan);
+        using var writer = new StreamWriter(outStream, Encoding.UTF8, _options.BufferSize);
+
+        try
+        {
+            while (true)
+            {
+                var number = br.ReadInt64();
+                var text = br.ReadString();
+                writer.Write(number);
+                writer.Write(". ");
+                writer.WriteLine(text);
+            }
+        }
+        catch (EndOfStreamException) { }
+    }
+
     // -------------------------------------------------------------------
-    //  Phase 2 — buffered k-way merge
+    //  Phase 2 — buffered binary k-way merge
     // -------------------------------------------------------------------
 
     private void MergeAll(
@@ -287,8 +406,8 @@ public sealed class ExternalSorter
             for (var g = 0; g < groups.Count; g++)
             {
                 ct.ThrowIfCancellationRequested();
-                var mergedPath = Path.Combine(tempDir, $"merge_L{level}_{g:D4}.txt");
-                KWayMerge(groups[g], mergedPath, ct);
+                var mergedPath = Path.Combine(tempDir, $"merge_L{level}_{g:D4}.bin");
+                KWayMergeBinary(groups[g], mergedPath, ct);
                 next.Add(mergedPath);
 
                 foreach (var f in groups[g])
@@ -300,24 +419,52 @@ public sealed class ExternalSorter
             level++;
         }
 
-        KWayMerge(current, outputPath, ct);
+        KWayMergeToText(current, outputPath, ct);
     }
 
-    /// <summary>
-    /// K-way merge using buffered chunk readers and PriorityQueue.
-    /// Each reader pre-fetches <see cref="BufferedChunkReader.BatchSize"/> lines at a time
-    /// into an internal buffer, drastically reducing I/O syscall frequency.
-    /// </summary>
-    private void KWayMerge(List<string> inputFiles, string outputPath, CancellationToken ct)
+    private void KWayMergeBinary(List<string> inputFiles, string outputPath, CancellationToken ct)
     {
-        var readers = new BufferedChunkReader[inputFiles.Count];
+        var readers = new BinaryChunkReader[inputFiles.Count];
         try
         {
             var pq = new PriorityQueue<int, LineEntry>(inputFiles.Count);
-
             for (var i = 0; i < inputFiles.Count; i++)
             {
-                readers[i] = new BufferedChunkReader(inputFiles[i], _options.BufferSize);
+                readers[i] = new BinaryChunkReader(inputFiles[i], _options.BufferSize);
+                if (readers[i].HasCurrent)
+                    pq.Enqueue(i, readers[i].Current);
+            }
+
+            using var outStream = new FileStream(outputPath, FileMode.Create, FileAccess.Write,
+                FileShare.None, _options.BufferSize, FileOptions.SequentialScan);
+            using var bw = new BinaryWriter(outStream, Encoding.UTF8, leaveOpen: false);
+
+            while (pq.Count > 0)
+            {
+                ct.ThrowIfCancellationRequested();
+                pq.TryDequeue(out var readerIdx, out var entry);
+                bw.Write(entry.Number);
+                bw.Write(entry.Text);
+                readers[readerIdx].Advance();
+                if (readers[readerIdx].HasCurrent)
+                    pq.Enqueue(readerIdx, readers[readerIdx].Current);
+            }
+        }
+        finally
+        {
+            foreach (var r in readers) r?.Dispose();
+        }
+    }
+
+    private void KWayMergeToText(List<string> inputFiles, string outputPath, CancellationToken ct)
+    {
+        var readers = new BinaryChunkReader[inputFiles.Count];
+        try
+        {
+            var pq = new PriorityQueue<int, LineEntry>(inputFiles.Count);
+            for (var i = 0; i < inputFiles.Count; i++)
+            {
+                readers[i] = new BinaryChunkReader(inputFiles[i], _options.BufferSize);
                 if (readers[i].HasCurrent)
                     pq.Enqueue(i, readers[i].Current);
             }
@@ -329,10 +476,10 @@ public sealed class ExternalSorter
             while (pq.Count > 0)
             {
                 ct.ThrowIfCancellationRequested();
-
                 pq.TryDequeue(out var readerIdx, out var entry);
-                WriteEntry(writer, in entry);
-
+                writer.Write(entry.Number);
+                writer.Write(". ");
+                writer.WriteLine(entry.Text);
                 readers[readerIdx].Advance();
                 if (readers[readerIdx].HasCurrent)
                     pq.Enqueue(readerIdx, readers[readerIdx].Current);
@@ -340,8 +487,7 @@ public sealed class ExternalSorter
         }
         finally
         {
-            foreach (var r in readers)
-                r?.Dispose();
+            foreach (var r in readers) r?.Dispose();
         }
     }
 
@@ -350,21 +496,7 @@ public sealed class ExternalSorter
     // -------------------------------------------------------------------
 
     private int EstimateChunkCapacity()
-    {
-        // Rough estimate: ~80 bytes per entry in memory
-        return (int)Math.Min(_options.MaxMemoryPerChunk / 80, int.MaxValue / 2);
-    }
-
-    /// <summary>
-    /// Writes a line entry directly without allocating an intermediate string.
-    /// TextWriter.Write(long) formats the number straight into its buffer.
-    /// </summary>
-    private static void WriteEntry(TextWriter writer, in LineEntry entry)
-    {
-        writer.Write(entry.Number);
-        writer.Write(". ");
-        writer.WriteLine(entry.Text);
-    }
+        => (int)Math.Min(_options.MaxMemoryPerChunk / 96, int.MaxValue / 2);
 
     private static List<List<string>> Partition(List<string> items, int groupSize)
     {
@@ -387,26 +519,24 @@ public sealed class ExternalSorter
     private readonly record struct ChunkPayload(LineEntry[] Data, int Count, int Index);
 
     /// <summary>
-    /// Reads parsed lines from a sorted chunk file in batches.
-    /// Instead of one ReadLine call per PriorityQueue dequeue, we read
-    /// <see cref="BatchSize"/> lines at once into a local buffer, then
-    /// serve them from memory. This reduces I/O syscall frequency by ~8000x.
+    /// Reads LineEntry records from a binary chunk file in batches.
+    /// No text parsing — BinaryReader.ReadInt64() + ReadString().
     /// </summary>
-    private sealed class BufferedChunkReader : IDisposable
+    private sealed class BinaryChunkReader : IDisposable
     {
-        internal const int BatchSize = 8192;
+        private const int BatchSize = 8192;
 
-        private readonly StreamReader _reader;
+        private readonly BinaryReader _reader;
         private readonly LineEntry[] _buffer = new LineEntry[BatchSize];
         private int _pos;
         private int _count;
         private bool _eof;
 
-        public BufferedChunkReader(string path, int ioBufferSize)
+        public BinaryChunkReader(string path, int ioBufferSize)
         {
             var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
                 FileShare.Read, ioBufferSize, FileOptions.SequentialScan);
-            _reader = new StreamReader(stream, Encoding.UTF8, false, ioBufferSize);
+            _reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: false);
             Refill();
         }
 
@@ -424,12 +554,19 @@ public sealed class ExternalSorter
         {
             _pos = 0;
             _count = 0;
-
             while (_count < BatchSize)
             {
-                var line = _reader.ReadLine();
-                if (line == null) { _eof = true; break; }
-                _buffer[_count++] = LineParser.Parse(line);
+                try
+                {
+                    var number = _reader.ReadInt64();
+                    var text = _reader.ReadString();
+                    _buffer[_count++] = new LineEntry(number, text);
+                }
+                catch (EndOfStreamException)
+                {
+                    _eof = true;
+                    break;
+                }
             }
         }
 
