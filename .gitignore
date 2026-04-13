@@ -54,3 +54,4 @@ Thumbs.db
 
 ## Temp/generated test files
 *.generated.txt
+data/
