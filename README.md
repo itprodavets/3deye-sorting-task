@@ -31,6 +31,14 @@ benchmarks/
 dotnet build
 ```
 
+## Quick Start
+
+Interactive menu with all operations:
+
+```bash
+./run.sh
+```
+
 ## Usage
 
 ### Generate a test file
