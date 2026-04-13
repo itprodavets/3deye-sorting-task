@@ -30,7 +30,7 @@ public sealed class FileGenerator
 
         await using var stream = new FileStream(outputPath, FileMode.Create, FileAccess.Write,
             FileShare.None, _options.BufferSize, FileOptions.SequentialScan);
-        await using var writer = new StreamWriter(stream, Encoding.UTF8, _options.BufferSize);
+        await using var writer = new StreamWriter(stream, new UTF8Encoding(false), _options.BufferSize);
 
         long bytesWritten = 0;
         var lastReported = 0L;
