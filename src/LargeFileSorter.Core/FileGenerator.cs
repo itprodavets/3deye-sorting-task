@@ -2,7 +2,7 @@ using System.Text;
 
 namespace LargeFileSorter.Core;
 
-public sealed class FileGenerator
+public sealed class FileGenerator : IFileGenerator
 {
     private static readonly string[] WordPool =
     [
