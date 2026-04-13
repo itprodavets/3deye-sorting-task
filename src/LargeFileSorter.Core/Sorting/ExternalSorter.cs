@@ -20,6 +20,12 @@ public sealed class ExternalSorter : IFileSorter
 {
     private readonly SortOptions _options;
 
+    // Custom pool that can actually cache large chunk arrays (up to 32M entries).
+    // ArrayPool<T>.Shared silently drops arrays > 1M elements on Return,
+    // defeating the entire purpose of pooling for our chunk sizes.
+    private static readonly ArrayPool<LineEntry> ChunkPool =
+        ArrayPool<LineEntry>.Create(maxArrayLength: 32 * 1024 * 1024, maxArraysPerBucket: 4);
+
     public ExternalSorter(SortOptions? options = null)
     {
         _options = options ?? new SortOptions();
@@ -141,7 +147,7 @@ public sealed class ExternalSorter : IFileSorter
                     }
                     finally
                     {
-                        ArrayPool<LineEntry>.Shared.Return(payload.Data, clearArray: true);
+                        ChunkPool.Return(payload.Data, clearArray: true);
                     }
                 }
             }, ct);
@@ -158,11 +164,10 @@ public sealed class ExternalSorter : IFileSorter
         string inputPath, ChannelWriter<ChunkPayload> writer,
         IProgress<string>? progress, CancellationToken ct)
     {
-        var pool = ArrayPool<LineEntry>.Shared;
         var stringPool = new Dictionary<string, string>(4096, StringComparer.Ordinal);
 
         var capacity = EstimateChunkCapacity();
-        var array = pool.Rent(capacity);
+        var array = ChunkPool.Rent(capacity);
         var count = 0;
         long estimatedBytes = 0;
         var chunkIndex = 0;
@@ -202,18 +207,24 @@ public sealed class ExternalSorter : IFileSorter
                     ct.ThrowIfCancellationRequested();
 
                     var entry = ParseLineFromSequence(lineSeq);
-                    entry = DeduplicateText(entry, stringPool);
+                    var isDuplicate = DeduplicateText(ref entry, stringPool);
 
                     if (count >= array.Length)
                     {
-                        var bigger = pool.Rent(array.Length * 2);
+                        var bigger = ChunkPool.Rent(array.Length * 2);
                         array.AsSpan(0, count).CopyTo(bigger);
-                        pool.Return(array, clearArray: true);
+                        ChunkPool.Return(array, clearArray: true);
                         array = bigger;
                     }
 
                     array[count++] = entry;
-                    estimatedBytes += 32 + 40 + entry.Text.Length * 2;
+
+                    // Only count string memory for the first occurrence.
+                    // Deduplicated entries share the same string reference,
+                    // so counting them again would underestimate actual capacity.
+                    estimatedBytes += 32; // struct overhead (Number + ref + sortKey)
+                    if (!isDuplicate)
+                        estimatedBytes += 40 + entry.Text.Length * 2; // string obj + chars
 
                     if (estimatedBytes >= _options.MaxMemoryPerChunk)
                     {
@@ -222,7 +233,7 @@ public sealed class ExternalSorter : IFileSorter
                         await writer.WriteAsync(new ChunkPayload(array, count, idx), ct);
 
                         capacity = EstimateChunkCapacity();
-                        array = pool.Rent(capacity);
+                        array = ChunkPool.Rent(capacity);
                         count = 0;
                         estimatedBytes = 0;
                         stringPool.Clear();
@@ -236,13 +247,13 @@ public sealed class ExternalSorter : IFileSorter
                     if (!buffer.IsEmpty)
                     {
                         var entry = ParseLineFromSequence(buffer);
-                        entry = DeduplicateText(entry, stringPool);
+                        DeduplicateText(ref entry, stringPool);
 
                         if (count >= array.Length)
                         {
-                            var bigger = pool.Rent(array.Length * 2);
+                            var bigger = ChunkPool.Rent(array.Length * 2);
                             array.AsSpan(0, count).CopyTo(bigger);
-                            pool.Return(array, clearArray: true);
+                            ChunkPool.Return(array, clearArray: true);
                             array = bigger;
                         }
                         array[count++] = entry;
@@ -267,7 +278,7 @@ public sealed class ExternalSorter : IFileSorter
         }
         else
         {
-            pool.Return(array, clearArray: true);
+            ChunkPool.Return(array, clearArray: true);
         }
     }
 
@@ -319,13 +330,17 @@ public sealed class ExternalSorter : IFileSorter
         }
     }
 
-    private static LineEntry DeduplicateText(LineEntry entry, Dictionary<string, string> pool)
+    /// <returns>true if the text was already in the pool (deduplicated).</returns>
+    private static bool DeduplicateText(ref LineEntry entry, Dictionary<string, string> pool)
     {
         if (pool.TryGetValue(entry.Text, out var existing))
-            return new LineEntry(entry.Number, existing);
+        {
+            entry = new LineEntry(entry.Number, existing);
+            return true;
+        }
 
         pool[entry.Text] = entry.Text;
-        return entry;
+        return false;
     }
 
     private static bool CopyAndCheck(ReadOnlySequence<byte> seq, ReadOnlySpan<byte> expected)

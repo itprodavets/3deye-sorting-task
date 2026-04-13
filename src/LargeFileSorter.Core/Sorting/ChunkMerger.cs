@@ -66,7 +66,7 @@ internal sealed class ChunkMerger
 
             using var outStream = new FileStream(outputPath, FileMode.Create, FileAccess.Write,
                 FileShare.None, _bufferSize, FileOptions.SequentialScan);
-            using var bw = new BinaryWriter(outStream, Encoding.UTF8, leaveOpen: false);
+            using var bw = new BinaryWriter(outStream, new UTF8Encoding(false), leaveOpen: false);
 
             while (pq.Count > 0)
             {
@@ -100,7 +100,7 @@ internal sealed class ChunkMerger
 
             using var outStream = new FileStream(outputPath, FileMode.Create, FileAccess.Write,
                 FileShare.None, _bufferSize, FileOptions.SequentialScan);
-            using var writer = new StreamWriter(outStream, Encoding.UTF8, _bufferSize);
+            using var writer = new StreamWriter(outStream, new UTF8Encoding(false), _bufferSize);
 
             while (pq.Count > 0)
             {

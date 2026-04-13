@@ -13,7 +13,7 @@ internal static class BinaryChunkWriter
     {
         using var stream = new FileStream(path, FileMode.Create, FileAccess.Write,
             FileShare.None, 65536, FileOptions.SequentialScan);
-        using var bw = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: false);
+        using var bw = new BinaryWriter(stream, new UTF8Encoding(false), leaveOpen: false);
 
         for (var i = 0; i < count; i++)
         {
@@ -30,11 +30,11 @@ internal static class BinaryChunkWriter
     {
         using var inStream = new FileStream(binaryChunkPath, FileMode.Open, FileAccess.Read,
             FileShare.Read, bufferSize, FileOptions.SequentialScan);
-        using var br = new BinaryReader(inStream, Encoding.UTF8, leaveOpen: false);
+        using var br = new BinaryReader(inStream, new UTF8Encoding(false), leaveOpen: false);
 
         using var outStream = new FileStream(outputPath, FileMode.Create, FileAccess.Write,
             FileShare.None, bufferSize, FileOptions.SequentialScan);
-        using var writer = new StreamWriter(outStream, Encoding.UTF8, bufferSize);
+        using var writer = new StreamWriter(outStream, new UTF8Encoding(false), bufferSize);
 
         try
         {
