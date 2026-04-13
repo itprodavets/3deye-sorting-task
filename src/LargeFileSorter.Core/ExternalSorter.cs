@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.IO.Pipelines;
+using System.Runtime;
 using System.Threading.Channels;
 
 namespace LargeFileSorter.Core;
@@ -35,31 +36,55 @@ public sealed class ExternalSorter : IFileSorter
             $"filesort_{Guid.NewGuid():N}");
         Directory.CreateDirectory(tempDir);
 
+        // Pre-warm the thread pool so Parallel.For inside sort workers
+        // doesn't stall waiting for thread injection.
+        EnsureMinThreads();
+
         try
         {
-            progress?.Report("Phase 1: splitting and sorting chunks...");
-            var chunkFiles = await SplitAndSortAsync(inputPath, tempDir, progress, ct);
-
-            if (chunkFiles.Count == 0)
+            // Reduce GC pause frequency during the allocation-heavy split phase.
+            // SustainedLowLatency prevents full blocking Gen2 collections while
+            // Gen0/Gen1 still run — keeps throughput high without OOM risk.
+            var previousLatency = GCSettings.LatencyMode;
+            try
             {
-                await using (File.Create(outputPath)) { }
-                return;
-            }
+                GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
 
-            if (chunkFiles.Count == 1)
+                progress?.Report("Phase 1: splitting and sorting chunks...");
+                var chunkFiles = await SplitAndSortAsync(inputPath, tempDir, progress, ct);
+
+                if (chunkFiles.Count == 0)
+                {
+                    await using (File.Create(outputPath)) { }
+                    return;
+                }
+
+                if (chunkFiles.Count == 1)
+                {
+                    BinaryChunkWriter.ConvertToText(chunkFiles[0], outputPath, _options.BufferSize);
+                    progress?.Report("Done (single chunk).");
+                    return;
+                }
+
+                // Restore default GC mode for the I/O-heavy merge phase
+                GCSettings.LatencyMode = previousLatency;
+
+                // Hint to the GC: a good time to collect Phase 1 allocations
+                // before the I/O-heavy merge phase begins.
+                GC.Collect(2, GCCollectionMode.Optimized, blocking: false);
+
+                progress?.Report($"Phase 2: merging {chunkFiles.Count} sorted chunks...");
+                var merger = new ChunkMerger(
+                    _options.BufferSize,
+                    _options.MergeWidth,
+                    path => new BinaryChunkReader(path, _options.BufferSize));
+                merger.MergeAll(chunkFiles, outputPath, tempDir, progress, ct);
+                progress?.Report("Done.");
+            }
+            finally
             {
-                BinaryChunkWriter.ConvertToText(chunkFiles[0], outputPath, _options.BufferSize);
-                progress?.Report("Done (single chunk).");
-                return;
+                GCSettings.LatencyMode = previousLatency;
             }
-
-            progress?.Report($"Phase 2: merging {chunkFiles.Count} sorted chunks...");
-            var merger = new ChunkMerger(
-                _options.BufferSize,
-                _options.MergeWidth,
-                path => new BinaryChunkReader(path, _options.BufferSize));
-            merger.MergeAll(chunkFiles, outputPath, tempDir, progress, ct);
-            progress?.Report("Done.");
         }
         finally
         {
@@ -74,8 +99,17 @@ public sealed class ExternalSorter : IFileSorter
     private async Task<List<string>> SplitAndSortAsync(
         string inputPath, string tempDir, IProgress<string>? progress, CancellationToken ct)
     {
+        // Scale sort workers to available cores: each worker runs sort + binary write
+        // concurrently, overlapping CPU-heavy sort with I/O-heavy write.
+        var workerCount = Math.Clamp(Environment.ProcessorCount / 2, 1, 4);
+        var sortParallelism = Math.Max(2, Environment.ProcessorCount / workerCount);
+
         var channel = Channel.CreateBounded<ChunkPayload>(
-            new BoundedChannelOptions(1) { SingleWriter = true });
+            new BoundedChannelOptions(workerCount)
+            {
+                SingleWriter = true,
+                SingleReader = workerCount == 1
+            });
 
         var chunkPaths = new List<string>();
         var pathLock = new object();
@@ -86,29 +120,35 @@ public sealed class ExternalSorter : IFileSorter
             channel.Writer.Complete();
         }, ct);
 
-        var sortTask = Task.Run(async () =>
+        // Spawn N sort workers — Channel ensures each chunk is processed by exactly one worker.
+        var sortTasks = new Task[workerCount];
+        for (var w = 0; w < workerCount; w++)
         {
-            await foreach (var payload in channel.Reader.ReadAllAsync(ct))
+            var parallelism = sortParallelism;
+            sortTasks[w] = Task.Run(async () =>
             {
-                try
+                await foreach (var payload in channel.Reader.ReadAllAsync(ct))
                 {
-                    ChunkSorter.Sort(payload.Data, payload.Count);
+                    try
+                    {
+                        ChunkSorter.Sort(payload.Data, payload.Count, parallelism);
 
-                    var path = Path.Combine(tempDir, $"chunk_{payload.Index:D6}.bin");
-                    BinaryChunkWriter.Write(path, payload.Data, payload.Count);
+                        var path = Path.Combine(tempDir, $"chunk_{payload.Index:D6}.bin");
+                        BinaryChunkWriter.Write(path, payload.Data, payload.Count);
 
-                    lock (pathLock)
-                        chunkPaths.Add(path);
+                        lock (pathLock)
+                            chunkPaths.Add(path);
+                    }
+                    finally
+                    {
+                        ArrayPool<LineEntry>.Shared.Return(payload.Data, clearArray: true);
+                    }
                 }
-                finally
-                {
-                    ArrayPool<LineEntry>.Shared.Return(payload.Data, clearArray: true);
-                }
-            }
-        }, ct);
+            }, ct);
+        }
 
         await readerTask;
-        await sortTask;
+        await Task.WhenAll(sortTasks);
 
         chunkPaths.Sort(StringComparer.Ordinal);
         return chunkPaths;
@@ -301,6 +341,19 @@ public sealed class ExternalSorter : IFileSorter
 
     private int EstimateChunkCapacity()
         => (int)Math.Min(_options.MaxMemoryPerChunk / 96, int.MaxValue / 2);
+
+    /// <summary>
+    /// Pre-warms the thread pool so <see cref="Parallel.For"/> and
+    /// <see cref="Task.Run"/> don't stall waiting for thread injection
+    /// on the first few chunks.
+    /// </summary>
+    private static void EnsureMinThreads()
+    {
+        var desired = Environment.ProcessorCount;
+        ThreadPool.GetMinThreads(out var currentWorker, out var currentIo);
+        if (currentWorker < desired)
+            ThreadPool.SetMinThreads(desired, currentIo);
+    }
 
     private static void TryDeleteDirectory(string path)
     {
