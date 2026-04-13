@@ -41,10 +41,16 @@ public sealed class FileGenerator
 
             var number = random.NextInt64(1, _options.MaxNumber + 1);
             var phrase = phrases[random.Next(phrases.Length)];
-            var line = $"{number}. {phrase}";
 
-            await writer.WriteLineAsync(line.AsMemory(), ct);
-            bytesWritten += Encoding.UTF8.GetByteCount(line) + 1; // +1 for newline
+            // Write parts directly — avoids allocating an interpolated string per line.
+            // TextWriter.Write(long) formats the number straight into its internal buffer.
+            writer.Write(number);
+            writer.Write(". ");
+            writer.WriteLine(phrase);
+
+            // Estimate byte length without calling Encoding.GetByteCount per line.
+            // Our phrases are ASCII, so char count ≈ byte count in UTF-8.
+            bytesWritten += DigitCount(number) + 2 + phrase.Length + 1;
 
             if (progress != null && bytesWritten - lastReported >= 10 * 1024 * 1024)
             {
@@ -72,7 +78,6 @@ public sealed class FileGenerator
                 sb.Append(WordPool[random.Next(WordPool.Length)]);
             }
 
-            // Capitalize first letter
             if (sb.Length > 0 && char.IsLower(sb[0]))
                 sb[0] = char.ToUpperInvariant(sb[0]);
 
@@ -80,5 +85,16 @@ public sealed class FileGenerator
         }
 
         return phrases;
+    }
+
+    private static int DigitCount(long n)
+    {
+        if (n < 10L) return 1;
+        if (n < 100L) return 2;
+        if (n < 1_000L) return 3;
+        if (n < 10_000L) return 4;
+        if (n < 100_000L) return 5;
+        if (n < 1_000_000L) return 6;
+        return (int)Math.Log10(n) + 1;
     }
 }
