@@ -18,7 +18,8 @@ src/
                                BinaryChunkReader, BinaryChunkWriter)
     LineEntry.cs               Core model with precomputed sort key
     LineParser.cs              UTF-8 & string parsing
-    SortOptions.cs             Sorter configuration
+    SortOptions.cs             Configuration + HardwareProfile (auto-tuning)
+    SizeFormatter.cs           Shared byte-size formatting utility
     GeneratorOptions.cs        Generator configuration
     FileGenerator.cs           Test file generator
   LargeFileSorter.Generator/   CLI tool to generate test files
@@ -363,7 +364,7 @@ The codebase follows **SOLID** principles:
 
 | Principle | Implementation |
 |-----------|---------------|
-| **Single Responsibility** | `ExternalSorter` orchestrates; `ChunkSorter`, `ChunkMerger`, `BinaryChunkReader`, `BinaryChunkWriter` each handle one concern |
+| **Single Responsibility** | `ExternalSorter` orchestrates; `ChunkSorter`, `ChunkMerger`, `BinaryChunkReader`, `BinaryChunkWriter` each handle one concern; `SizeFormatter` centralizes formatting; `HardwareProfile` encapsulates diagnostics |
 | **Open/Closed** | New sort strategies can implement `IFileSorter`; new chunk formats can implement `IChunkReader` |
 | **Liskov Substitution** | All interface implementations honor their contracts |
 | **Interface Segregation** | `IFileSorter` (sort), `IFileGenerator` (generate), `IChunkReader` (read) — each focused on one operation |
