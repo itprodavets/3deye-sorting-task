@@ -118,7 +118,7 @@ public sealed class ExternalSorter : IFileSorter
             });
 
         var chunkPaths = new List<string>();
-        var pathLock = new object();
+        var pathLock = new Lock();
 
         var readerTask = Task.Run(async () =>
         {
@@ -164,7 +164,7 @@ public sealed class ExternalSorter : IFileSorter
         string inputPath, ChannelWriter<ChunkPayload> writer,
         IProgress<string>? progress, CancellationToken ct)
     {
-        var stringPool = new Dictionary<string, string>(4096, StringComparer.Ordinal);
+        var textPool = new TextPool();
 
         var capacity = EstimateChunkCapacity();
         var array = ChunkPool.Rent(capacity);
@@ -206,8 +206,7 @@ public sealed class ExternalSorter : IFileSorter
                 {
                     ct.ThrowIfCancellationRequested();
 
-                    var entry = ParseLineFromSequence(lineSeq);
-                    var isDuplicate = DeduplicateText(ref entry, stringPool);
+                    var entry = ParseAndIntern(lineSeq, textPool, out var isDuplicate);
 
                     if (count >= array.Length)
                     {
@@ -236,7 +235,7 @@ public sealed class ExternalSorter : IFileSorter
                         array = ChunkPool.Rent(capacity);
                         count = 0;
                         estimatedBytes = 0;
-                        stringPool.Clear();
+                        textPool.Clear();
                     }
                 }
 
@@ -246,8 +245,7 @@ public sealed class ExternalSorter : IFileSorter
                     // the pipe may reclaim buffer memory after AdvanceTo.
                     if (!buffer.IsEmpty)
                     {
-                        var entry = ParseLineFromSequence(buffer);
-                        DeduplicateText(ref entry, stringPool);
+                        var entry = ParseAndIntern(buffer, textPool, out _);
 
                         if (count >= array.Length)
                         {
@@ -300,7 +298,14 @@ public sealed class ExternalSorter : IFileSorter
         return true;
     }
 
-    private static LineEntry ParseLineFromSequence(ReadOnlySequence<byte> lineSeq)
+    /// <summary>
+    /// Parses a line from a byte sequence and interns the text in a single step.
+    /// Combines parsing + deduplication to avoid allocating a string for duplicate text.
+    /// Uses <see cref="LineParser.ParseNumberUtf8"/> (no string alloc) followed by
+    /// <see cref="TextPool.Intern"/> (AlternateLookup — string alloc only for new text).
+    /// </summary>
+    private static LineEntry ParseAndIntern(
+        ReadOnlySequence<byte> lineSeq, TextPool textPool, out bool isDuplicate)
     {
         // Trim \r
         if (lineSeq.Length > 0)
@@ -314,7 +319,7 @@ public sealed class ExternalSorter : IFileSorter
             throw new FormatException("Empty line");
 
         if (lineSeq.IsSingleSegment)
-            return LineParser.ParseUtf8(lineSeq.FirstSpan);
+            return ParseAndInternSpan(lineSeq.FirstSpan, textPool, out isDuplicate);
 
         // Multi-segment (rare — only at buffer boundaries)
         var length = (int)lineSeq.Length;
@@ -322,7 +327,7 @@ public sealed class ExternalSorter : IFileSorter
         try
         {
             lineSeq.CopyTo(rented);
-            return LineParser.ParseUtf8(rented.AsSpan(0, length));
+            return ParseAndInternSpan(rented.AsSpan(0, length), textPool, out isDuplicate);
         }
         finally
         {
@@ -330,17 +335,12 @@ public sealed class ExternalSorter : IFileSorter
         }
     }
 
-    /// <returns>true if the text was already in the pool (deduplicated).</returns>
-    private static bool DeduplicateText(ref LineEntry entry, Dictionary<string, string> pool)
+    private static LineEntry ParseAndInternSpan(
+        ReadOnlySpan<byte> utf8Line, TextPool textPool, out bool isDuplicate)
     {
-        if (pool.TryGetValue(entry.Text, out var existing))
-        {
-            entry = new LineEntry(entry.Number, existing);
-            return true;
-        }
-
-        pool[entry.Text] = entry.Text;
-        return false;
+        var number = LineParser.ParseNumberUtf8(utf8Line, out var textStart);
+        var text = textPool.Intern(utf8Line[textStart..], out isDuplicate);
+        return new LineEntry(number, text);
     }
 
     private static bool CopyAndCheck(ReadOnlySequence<byte> seq, ReadOnlySpan<byte> expected)
