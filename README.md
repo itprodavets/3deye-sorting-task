@@ -43,51 +43,160 @@ dotnet build
 
 ## Quick Start
 
-Interactive menu with all operations:
+The easiest way to try everything — interactive menu with guided prompts:
 
 ```bash
+chmod +x run.sh
 ./run.sh
 ```
 
+The menu offers: generate a test file, sort a file, full pipeline (generate + sort), run tests, benchmarks, build, and clean.
+
 ## Usage
 
-### Generate a test file
+### 1. Generate a test file
+
+Creates a file in the required `<Number>. <String>` format with random data.
 
 ```bash
-dotnet run --project src/LargeFileSorter.Generator -- output.txt 1GB
-
-# Options
-dotnet run --project src/LargeFileSorter.Generator -- output.txt 500MB \
-    --phrases 1000 \
-    --max-number 999999 \
-    --seed 42
+dotnet run --project src/LargeFileSorter.Generator -- <output-file> <size>
 ```
 
-### Sort a file
+**Arguments:**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `<output-file>` | yes | Path to the file to create |
+| `<size>` | yes | Target file size: `100KB`, `500MB`, `1GB`, etc. |
+
+**Options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--phrases <count>` | 500 | Number of unique text phrases in the file |
+| `--max-number <num>` | 100000 | Maximum value for the number part of each line |
+| `--seed <value>` | random | Fixed seed for reproducible output |
+
+**Examples:**
 
 ```bash
-dotnet run --project src/LargeFileSorter.Sorter -- input.txt sorted.txt
+# Basic — generate a 1 GB test file
+dotnet run --project src/LargeFileSorter.Generator -- data/test.txt 1GB
 
-# Options
-dotnet run --project src/LargeFileSorter.Sorter -- input.txt sorted.txt \
-    --memory 1GB \
-    --merge-width 32 \
-    --temp-dir /mnt/fast-ssd/tmp \
-    --buffer 4MB \
-    --workers 2
+# Reproducible — same seed always produces the same file
+dotnet run --project src/LargeFileSorter.Generator -- data/test.txt 500MB --seed 42
+
+# Many unique phrases — more variety in text values
+dotnet run --project src/LargeFileSorter.Generator -- data/test.txt 5GB \
+    --phrases 10000 --max-number 999999
 ```
 
-### Run tests
+**Example output:**
+
+```
+Generating file: data/test.txt
+Target size: 1.0 GB
+Unique phrases: 500
+Progress: 1.0 GB / 1.0 GB
+Done in 00:00:03.214. Actual size: 1.0 GB
+```
+
+### 2. Sort a file
+
+Sorts the generated file using external merge sort. By default, all parameters are auto-tuned to the available hardware — no manual configuration needed.
+
+```bash
+dotnet run --project src/LargeFileSorter.Sorter -- <input-file> <output-file>
+```
+
+**Arguments:**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `<input-file>` | yes | Path to the unsorted input file |
+| `<output-file>` | yes | Path where the sorted result will be written |
+
+**Options (all optional — defaults auto-tune to hardware):**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--memory <size>` | auto (~25% RAM) | Max memory per chunk, e.g. `512MB`, `1GB`, `4GB` |
+| `--buffer <size>` | auto (1–16 MB) | I/O buffer size, e.g. `1MB`, `4MB`, `16MB` |
+| `--workers <num>` | auto (1–4) | Number of concurrent sort workers |
+| `--merge-width <num>` | 64 | Max files to merge in a single pass |
+| `--temp-dir <path>` | system temp | Directory for temporary chunk files |
+
+**Examples:**
+
+```bash
+# Basic — auto-tuned to hardware, no flags needed
+dotnet run --project src/LargeFileSorter.Sorter -- data/test.txt data/sorted.txt
+
+# Limit memory — useful if other processes need RAM
+dotnet run --project src/LargeFileSorter.Sorter -- data/test.txt data/sorted.txt \
+    --memory 1GB --workers 1
+
+# Maximum performance — large buffers, all workers, fast temp drive
+dotnet run --project src/LargeFileSorter.Sorter -- data/test.txt data/sorted.txt \
+    --buffer 16MB --workers 4 --temp-dir /mnt/nvme/tmp
+
+# Release mode for best performance (recommended for large files)
+dotnet run --project src/LargeFileSorter.Sorter -c Release -- data/test.txt data/sorted.txt
+```
+
+**Example output (64 GB machine):**
+
+```
+Hardware: RAM: 64.0 GB, Cores: 16, Chunk budget: 8.0 GB, I/O buffer: 16 MB, Sort workers: 4
+
+Input:  data/test.txt (5.0 GB)
+Output: data/sorted.txt
+Chunk memory budget: 8.0 GB
+I/O buffer: 16 MB
+Sort workers: 4
+Merge width: 64
+
+Phase 1: splitting and sorting chunks...
+  chunk 0: 22,450,000 lines queued
+  chunk 1: 22,450,000 lines queued
+  ...
+Phase 2: merging 4 sorted chunks...
+Done.
+
+Completed in 00:00:36.200
+Output size: 5.0 GB
+```
+
+### 3. Full pipeline (generate + sort)
+
+The interactive menu (`./run.sh`, option 3) runs both steps in sequence and verifies the line count matches.
+
+```bash
+# Or manually:
+dotnet run --project src/LargeFileSorter.Generator -c Release -- data/input.txt 1GB --seed 42
+dotnet run --project src/LargeFileSorter.Sorter -c Release -- data/input.txt data/sorted.txt
+```
+
+### 4. Run tests
 
 ```bash
 dotnet test
+
+# Verbose output
+dotnet test --verbosity normal
 ```
 
-### Run benchmarks
+### 5. Run benchmarks
+
+Compares naive in-memory sort, sequential external sort, and optimized external sort:
 
 ```bash
 dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release
 ```
+
+### Cancellation
+
+The sorter supports graceful cancellation via `Ctrl+C`. It finishes the current operation and cleans up temporary files before exiting.
 
 ## Performance Results
 
