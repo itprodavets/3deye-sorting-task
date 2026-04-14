@@ -6,6 +6,9 @@
          on hot paths (TextPool.Intern, Utf8LineWriter.WriteEntry, LineEntry.CompareTo).
          All affected methods are verified safe: locals are always written before read. -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Enables AOT compatibility analysis at build time.
+         All public APIs are verified to avoid reflection/dynamic code generation. -->
+    <IsAotCompatible>true</IsAotCompatible>
   </PropertyGroup>
 
   <ItemGroup>

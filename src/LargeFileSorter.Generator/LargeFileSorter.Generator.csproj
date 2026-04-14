@@ -5,6 +5,10 @@
     <RootNamespace>LargeFileSorter.Generator</RootNamespace>
     <ServerGarbageCollection>true</ServerGarbageCollection>
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <IsAotCompatible>true</IsAotCompatible>
+    <PublishAot Condition="'$(PublishAot)' == 'true'">true</PublishAot>
+    <StripSymbols Condition="'$(PublishAot)' == 'true'">true</StripSymbols>
+    <OptimizationPreference Condition="'$(PublishAot)' == 'true'">Speed</OptimizationPreference>
   </PropertyGroup>
 
   <ItemGroup>
