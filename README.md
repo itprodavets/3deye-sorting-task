@@ -29,8 +29,9 @@ src/
   LargeFileSorter.Sorter/      CLI tool to sort files
 tests/
   LargeFileSorter.Tests/
-    Unit/                      Isolated tests (LineEntry, LineParser, ChunkSorter, BinaryChunkIO)
-    Integration/               File I/O tests (ExternalSorter, FileGenerator)
+    Unit/                      Isolated tests (LineEntry, LineParser, ChunkSorter, BinaryChunkIO,
+                               TextPool, Utf8LineWriter)
+    Integration/               File I/O tests (ExternalSorter, MmfSorter, FileGenerator)
 benchmarks/
   LargeFileSorter.Benchmarks/  Performance benchmarks (BenchmarkDotNet)
 ```
@@ -54,7 +55,7 @@ chmod +x run.sh
 ./run.sh
 ```
 
-The menu offers: generate a test file, sort a file, full pipeline (generate + sort), run tests, benchmarks, build, and clean.
+The menu offers: generate a test file, sort a file, full pipeline (generate + sort), run tests, benchmarks, build, publish native binaries (NativeAOT), and clean.
 
 ## Usage
 
@@ -153,28 +154,52 @@ dotnet run --project src/LargeFileSorter.Sorter -c Release -- data/test.txt data
     --strategy mmf
 ```
 
-**Example output (64 GB machine):**
+**Example output — auto strategy on 1 GB file (64 GB machine):**
 
 ```
 Hardware: RAM: 64.0 GB, Cores: 16, Chunk budget: 8.0 GB, I/O buffer: 16 MB, Sort workers: 4
 
-Input:  data/test.txt (5.0 GB)
+Input:  data/test.txt (1.0 GB)
 Output: data/sorted.txt
 Chunk memory budget: 8.0 GB
 I/O buffer: 16 MB
 Sort workers: 4
 Merge width: 64
+Strategy: mmf (memory-mapped + native memory)
+
+Phase 1: indexing and sorting (memory-mapped)...
+  chunk 0: 44,562,938 lines indexed
+Done (single chunk, memory-mapped).
+
+Completed in 00:00:09.633
+Output size: 1.0 GB
+```
+
+**Example output — stream strategy on 1 GB file with 256 MB chunks:**
+
+```
+Hardware: RAM: 64.0 GB, Cores: 16, Chunk budget: 8.0 GB, I/O buffer: 16 MB, Sort workers: 4
+
+Input:  data/test.txt (1.0 GB)
+Output: data/sorted.txt
+Chunk memory budget: 256 MB
+I/O buffer: 16 MB
+Sort workers: 4
+Merge width: 64
+Strategy: stream (PipeReader + Channel)
 
 Phase 1: splitting and sorting chunks...
-  chunk 0: 67,107,899 lines queued
-  chunk 1: 67,107,899 lines queued
-  chunk 2: 67,107,899 lines queued
-  chunk 3: 21,496,295 lines (final)
-Phase 2: merging 4 sorted chunks...
+  chunk 0: 8,387,643 lines queued
+  chunk 1: 8,387,643 lines queued
+  chunk 2: 8,387,643 lines queued
+  chunk 3: 8,387,643 lines queued
+  chunk 4: 8,387,643 lines queued
+  chunk 5: 2,624,723 lines (final)
+Phase 2: merging 6 sorted chunks...
 Done.
 
-Completed in 00:00:29.626
-Output size: 5.0 GB
+Completed in 00:00:06.331
+Output size: 1.0 GB
 ```
 
 ### 3. Full pipeline (generate + sort)
@@ -243,13 +268,15 @@ Measured on Apple M4 Max (16 cores), 64 GB RAM, macOS, .NET 10.
 
 ### Throughput
 
-| File Size | Lines | Chunks | Time | Throughput |
-|-----------|-------|--------|------|------------|
-| 1 GB | 44.6 M | 1 (single chunk) | 7.6 s | 134 MB/s |
-| 1 GB | 44.6 M | 6 (256 MB chunks) | 6.3 s | 162 MB/s |
-| 5 GB | 222.8 M | 4 (2 GB chunks) | 29.6 s | 173 MB/s |
+| File Size | Lines | Strategy | Chunks | Time | Throughput |
+|-----------|-------|----------|--------|------|------------|
+| 200 MB | 8.7 M | mmf | 1 (single chunk) | 2.1 s | 96 MB/s |
+| 200 MB | 8.7 M | stream | 1 (single chunk) | 2.2 s | 91 MB/s |
+| 1 GB | 44.6 M | stream | 1 (single chunk) | 7.7 s | 134 MB/s |
+| 1 GB | 44.6 M | stream | 6 (256 MB chunks) | 6.3 s | 162 MB/s |
+| 5 GB | 222.8 M | stream | 4 (2 GB chunks) | 29.6 s | 173 MB/s |
 
-> Extrapolated: **100 GB in ~10 minutes** at sustained 173 MB/s.
+> Extrapolated: **100 GB in ~10 minutes** at sustained 173 MB/s (stream, multi-chunk).
 
 ### Strategy Comparison: Stream vs MMF
 
@@ -315,9 +342,12 @@ The `auto` strategy (default) picks MMF when the file fits in a single chunk, an
 
 ## Algorithm
 
-The sorter uses a two-phase **external merge sort**:
+The sorter uses a two-phase **external merge sort** with two interchangeable strategies (see [Sort Strategies](#sort-strategies)):
 
-### Phase 1 — Split & Sort (concurrent pipeline)
+### Phase 1 — Split & Sort
+
+**Stream strategy** (PipeReader + Channel — concurrent pipeline):
+
 1. A **reader task** reads the input file using `System.IO.Pipelines` (`PipeReader`), parsing lines directly from UTF-8 byte buffers — no per-line string allocation for the full line.
 2. Separator detection uses `SearchValues<byte>` (.NET 8+) for SIMD-accelerated dot search; numbers are parsed via `Utf8Parser.TryParse` — only the `Text` portion becomes a managed string.
 3. Filled chunks are sent through a **bounded `Channel`** to 1–4 sort workers — reader and sort workers run concurrently, overlapping disk I/O and CPU.
@@ -326,40 +356,67 @@ The sorter uses a two-phase **external merge sort**:
 6. Chunk arrays are returned to a **custom `ArrayPool<LineEntry>`** (max 32M elements) after writing. The default `Shared` pool silently drops arrays > 1M elements, so a dedicated pool is required for actual reuse.
 7. **Zero-allocation string deduplication** via `TextPool` — uses .NET 9+ `Dictionary.GetAlternateLookup<ReadOnlySpan<char>>` to check for duplicate text without allocating a string first. `stackalloc` is used for the UTF-8 → char conversion when text is ≤ 512 chars; larger text rents from `ArrayPool<char>`. Memory estimation counts string bytes only on first occurrence, resulting in fewer, larger chunks and less merge overhead.
 
+**MMF strategy** (MemoryMappedFile + NativeMemory — zero managed allocations):
+
+1. The entire file is mapped into virtual memory via `MemoryMappedFile.CreateFromFile`. The OS manages page caching — no explicit reads needed.
+2. A raw `byte*` pointer scans the mapped region, finding newlines with `SearchValues<byte>` SIMD search. Each line is parsed into an `EntryIndex` (28-byte struct: number, text offset, text length, 8-byte sort key) — **no string allocation, no GC involvement**.
+3. `EntryIndex` entries are stored in `NativeBuffer<T>` — a growable array backed by `NativeMemory.AlignedAlloc` (64-byte aligned). The GC has zero knowledge of this buffer.
+4. Sorting uses `Span<T>.Sort()` with parallel segments and k-way merge, comparing entries via the 8-byte UTF-8 prefix sort key (fast path) and falling back to `SequenceCompareTo` on the MMF bytes (slow path).
+5. Sorted entries are written to binary chunks by copying text bytes directly from the MMF — no string materialization needed. The binary format is identical to the stream strategy, so both share the same merge phase.
+
 ### Phase 2 — K-Way Merge (buffered)
+
+Shared by both strategies — the binary chunk format is identical:
+
 1. Each sorted chunk is wrapped in a **`BinaryChunkReader`** that reads binary records in batches of 8,192, using `BinaryReader.ReadInt64()` + `ReadString()` — no text parsing at all.
 2. A `PriorityQueue` (min-heap) selects the smallest entry across all chunk readers.
 3. Output is written via `Utf8LineWriter` — formats numbers directly to UTF-8 with `Utf8Formatter.TryFormat` (no `long.ToString()` allocation), and uses a pooled byte buffer with bulk flush to minimize syscalls.
 4. If chunk count exceeds `MergeWidth`, **multi-level merging** groups chunks to stay within file handle limits.
 
 ### Comparison Optimization
-`LineEntry` stores a **precomputed sort key**: the first 4 UTF-16 characters packed as a big-endian `ulong` with `[MethodImpl(AggressiveInlining)]`. This resolves ~80% of comparisons with a single integer compare, falling back to full `string.Compare` only when prefixes collide.
+
+Both strategies use **precomputed sort keys** to avoid full comparisons in the inner loop:
+
+- **Stream** (`LineEntry`): first 4 UTF-16 characters packed as a big-endian `ulong`. Resolves ~80% of comparisons with a single integer compare, falling back to `string.Compare` only when prefixes collide.
+- **MMF** (`EntryIndex`): first 8 raw UTF-8 bytes packed as a big-endian `ulong`. Resolves ~90% of comparisons without touching the memory-mapped file, falling back to `SequenceCompareTo` on the MMF byte range.
 
 ### GC & Runtime Tuning
 
-| Optimization | Purpose |
-|-------------|---------|
-| Server GC | One heap per logical core, parallel collection threads |
-| Concurrent GC | Background Gen2 — application threads never block |
-| RetainVM | Keep committed pages after GC; next chunk reuses the same memory without a kernel call |
-| SustainedLowLatency | Suppress full blocking Gen2 during Phase 1 (Gen0/Gen1 still run) |
-| GC.Collect between phases | Hint to reclaim Phase 1 allocations before I/O-heavy merge |
-| TieredPGO | JIT re-compiles hot methods using runtime profiling data |
-| AggressiveInlining | CompareTo inlined into sort inner loop |
-| `[SkipLocalsInit]` | No stack zeroing on hot paths (TextPool, Utf8LineWriter, LineEntry, ChunkSorter) |
-| `SearchValues<byte>` | SIMD-accelerated separator search — SSE2/AVX2/AVX-512 per platform |
-| `Span<T>.Sort()` | Span-based sort avoids Array.Sort bounds validation overhead |
-| ThreadPool pre-warm | SetMinThreads = ProcessorCount to avoid injection stall |
+| Optimization | Strategy | Purpose |
+|-------------|----------|---------|
+| Server GC | both | One heap per logical core, parallel collection threads |
+| Concurrent GC | both | Background Gen2 — application threads never block |
+| RetainVM | both | Keep committed pages after GC; next chunk reuses same memory without kernel call |
+| SustainedLowLatency | both | Suppress full blocking Gen2 during Phase 1 (Gen0/Gen1 still run) |
+| GC.Collect between phases | both | Hint to reclaim Phase 1 allocations before I/O-heavy merge |
+| TieredPGO | JIT | JIT re-compiles hot methods using runtime profiling data |
+| NativeAOT | both | Ahead-of-time compilation: 2.7 MB binary, 5 ms startup, no .NET runtime dependency |
+| `NativeMemory.AlignedAlloc` | mmf | GC-invisible growable array (64-byte aligned) for `EntryIndex` entries |
+| `MemoryMappedFile` | mmf | OS-managed page cache; text stays as byte offsets, no string allocation |
+| AggressiveInlining | both | `CompareTo` / `CompareEntries` inlined into sort inner loop |
+| `[SkipLocalsInit]` | both | No stack zeroing on hot paths (TextPool, Utf8LineWriter, LineEntry, ChunkSorter, MmfSorter) |
+| `SearchValues<byte>` | both | SIMD-accelerated separator / newline search per platform |
+| `Span<T>.Sort()` | both | Span-based sort avoids Array.Sort bounds validation overhead |
+| ThreadPool pre-warm | both | SetMinThreads = ProcessorCount to avoid injection stall |
 
 ### Memory Management
+
+**Shared (both strategies):**
 - Chunk memory budget auto-tunes to ~25% of available RAM (cap scales with machine: 1 GB on small, up to 8 GB on 64 GB+).
+- Binary chunk format avoids text re-parsing during merge — only the final output writes text.
+- `Utf8LineWriter` formats output directly to UTF-8 using `Utf8Formatter.TryFormat` — eliminates `long.ToString()` and StreamWriter char→byte encoding overhead.
+- All output uses cached `UTF8Encoding(false)` — no BOM in generated files, no per-writer allocation.
+
+**Stream strategy:**
 - Custom `ArrayPool<LineEntry>` (32M max) reuses chunk arrays across iterations — the default `Shared` pool only handles up to ~1M elements.
 - Bounded channel (capacity = worker count) limits in-flight chunks, keeping peak memory predictable.
 - `TextPool` with `AlternateLookup<ReadOnlySpan<char>>` deduplicates strings without allocating — uses `stackalloc` for small text, `ArrayPool<char>` for large text.
-- `Utf8LineWriter` formats output directly to UTF-8 using `Utf8Formatter.TryFormat` — eliminates `long.ToString()` and StreamWriter char→byte encoding overhead.
 - PipeReader reads large blocks (auto-scaled: 1–16 MB) with zero per-line allocation for the full input line.
-- Binary chunk format avoids text re-parsing during merge — only the final output writes text.
-- All output uses cached `UTF8Encoding(false)` — no BOM in generated files, no per-writer allocation.
+
+**MMF strategy:**
+- `NativeBuffer<EntryIndex>` stores 28-byte structs in `NativeMemory.AlignedAlloc` (64-byte aligned) — completely invisible to the GC, zero scan overhead regardless of buffer size.
+- Text data stays in the memory-mapped file as byte offsets — no string allocation during index, sort, or chunk write phases.
+- `MemoryMappedFile` delegates page management to the OS kernel — no explicit read buffers needed.
 
 ### Hardware Auto-Tuning
 
@@ -394,6 +451,7 @@ The stream strategy excels on data with repeating text (string dedup via `TextPo
 
 | Parameter       | Flag             | Default | Effect                                        |
 |-----------------|------------------|---------|-----------------------------------------------|
+| Strategy        | `--strategy`     | auto    | `stream` (concurrent pipeline), `mmf` (zero GC), `auto` (pick best) |
 | Chunk memory    | `--memory`       | auto (~25% RAM, capped) | Larger = fewer chunks, faster merge phase     |
 | Merge width     | `--merge-width`  | 64      | Wider = fewer merge levels, more file handles |
 | Buffer size     | `--buffer`       | auto (1–16 MB) | Larger = fewer I/O syscalls                   |
@@ -402,7 +460,7 @@ The stream strategy excels on data with repeating text (string dedup via `TextPo
 
 ## Algorithm Comparison
 
-The benchmark suite (`dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release`) compares three approaches to justify the design:
+The benchmark suite (`dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release`) compares four approaches to justify the design:
 
 ### 1. Naive In-Memory Sort
 
