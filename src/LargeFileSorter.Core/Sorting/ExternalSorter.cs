@@ -21,11 +21,13 @@ public sealed class ExternalSorter : IFileSorter
 {
     private readonly SortOptions _options;
 
-    // Custom pool that can actually cache large chunk arrays (up to 32M entries).
+    // Custom pool that can cache large chunk arrays (up to 256M entries).
     // ArrayPool<T>.Shared silently drops arrays > 1M elements on Return,
     // defeating the entire purpose of pooling for our chunk sizes.
+    // On a 64 GB machine with 8 GB chunk budget and TextPool deduplication,
+    // a single chunk can hold 200-300M entries — the pool must handle that.
     private static readonly ArrayPool<LineEntry> ChunkPool =
-        ArrayPool<LineEntry>.Create(maxArrayLength: 32 * 1024 * 1024, maxArraysPerBucket: 4);
+        ArrayPool<LineEntry>.Create(maxArrayLength: 256 * 1024 * 1024, maxArraysPerBucket: 4);
 
     public ExternalSorter(SortOptions? options = null)
     {
@@ -132,16 +134,20 @@ public sealed class ExternalSorter : IFileSorter
         for (var w = 0; w < workerCount; w++)
         {
             var parallelism = sortParallelism;
+            var ioBuffer = _options.BufferSize;
             sortTasks[w] = Task.Run(async () =>
             {
                 await foreach (var payload in channel.Reader.ReadAllAsync(ct))
                 {
                     try
                     {
-                        ChunkSorter.Sort(payload.Data, payload.Count, parallelism);
-
                         var path = Path.Combine(tempDir, $"chunk_{payload.Index:D6}.bin");
-                        BinaryChunkWriter.Write(path, payload.Data, payload.Count);
+
+                        // Sort and write in a single pass — for parallel-sorted chunks,
+                        // the k-way merge streams entries directly to disk instead of
+                        // allocating a full-copy merge buffer (~8 GB at 100 GB scale).
+                        ChunkSorter.SortAndWrite(
+                            payload.Data, payload.Count, parallelism, path, ioBuffer);
 
                         lock (pathLock)
                             chunkPaths.Add(path);
@@ -356,8 +362,13 @@ public sealed class ExternalSorter : IFileSorter
     //  Helpers
     // -------------------------------------------------------------------
 
-    private int EstimateChunkCapacity()
-        => (int)Math.Min(_options.MaxMemoryPerChunk / 96, int.MaxValue / 2);
+    /// <summary>
+    /// Initial capacity hint for the chunk array. Starts conservative (1M entries)
+    /// and grows via doubling as entries arrive. This keeps the first Rent within
+    /// the pool's range, avoiding an immediate LOH allocation for the full estimated
+    /// chunk size (which may be 100M+ entries with aggressive TextPool deduplication).
+    /// </summary>
+    private static int EstimateChunkCapacity() => 1024 * 1024;
 
     /// <summary>
     /// Checks that the temp directory has enough free disk space before starting.
