@@ -15,8 +15,10 @@ namespace LargeFileSorter.Core;
 ///   <item>Text encoded via <see cref="Encoding.UTF8.GetBytes(string, Span{byte})"/> — single pass, no intermediate buffer</item>
 ///   <item>All fields written to a single pooled byte buffer, flushed in bulk — fewer I/O syscalls</item>
 ///   <item>Buffer managed via <see cref="ArrayPool{T}"/> — no GC pressure from the writer itself</item>
+///   <item><see cref="SkipLocalsInitAttribute"/> — no stack zeroing overhead on hot path</item>
 /// </list>
 /// </summary>
+[SkipLocalsInit]
 internal sealed class Utf8LineWriter : IDisposable
 {
     private static readonly byte[] SeparatorBytes = ". "u8.ToArray();

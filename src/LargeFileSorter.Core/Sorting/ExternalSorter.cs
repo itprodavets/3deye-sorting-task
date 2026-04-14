@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.IO.Pipelines;
 using System.Runtime;
+using System.Runtime.CompilerServices;
 using System.Threading.Channels;
 
 namespace LargeFileSorter.Core;
@@ -335,6 +336,7 @@ public sealed class ExternalSorter : IFileSorter
         }
     }
 
+    [SkipLocalsInit]
     private static LineEntry ParseAndInternSpan(
         ReadOnlySpan<byte> utf8Line, TextPool textPool, out bool isDuplicate)
     {

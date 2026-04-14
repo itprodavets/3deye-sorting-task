@@ -1,4 +1,6 @@
+using System.Buffers;
 using System.Buffers.Text;
+using System.Runtime.CompilerServices;
 using System.Text;
 
 namespace LargeFileSorter.Core;
@@ -6,7 +8,11 @@ namespace LargeFileSorter.Core;
 public static class LineParser
 {
     private const string Separator = ". ";
-    private static readonly byte[] SeparatorUtf8 = ". "u8.ToArray();
+
+    // SIMD-accelerated byte search (.NET 8+). The number part is digits only,
+    // so the first '.' in the line is always our separator dot.
+    // SearchValues selects the optimal SIMD path per platform (SSE2/AVX2/AVX-512).
+    private static readonly SearchValues<byte> DotByte = SearchValues.Create("."u8);
 
     public static LineEntry Parse(string line)
     {
@@ -37,37 +43,48 @@ public static class LineParser
     /// <summary>
     /// Parses a line directly from UTF-8 bytes, avoiding the intermediate string allocation
     /// for the full line. Only the Text part is materialized as a managed string.
-    /// Used by the PipeReader-based input path.
+    /// Uses <see cref="SearchValues{T}"/> for SIMD-accelerated separator detection.
     /// </summary>
+    [SkipLocalsInit]
     public static LineEntry ParseUtf8(ReadOnlySpan<byte> utf8Line)
     {
-        var sepIdx = utf8Line.IndexOf(SeparatorUtf8);
-        if (sepIdx < 1)
-            throw new FormatException("Invalid line format, expected '<Number>. <Text>'");
+        var dotIdx = FindSeparatorDot(utf8Line);
 
-        if (!Utf8Parser.TryParse(utf8Line[..sepIdx], out long number, out _))
+        if (!Utf8Parser.TryParse(utf8Line[..dotIdx], out long number, out _))
             throw new FormatException("Failed to parse number from UTF-8 line");
 
-        var text = Encoding.UTF8.GetString(utf8Line[(sepIdx + SeparatorUtf8.Length)..]);
+        var text = Encoding.UTF8.GetString(utf8Line[(dotIdx + 2)..]); // skip ". "
         return new LineEntry(number, text);
     }
 
     /// <summary>
     /// Parses only the number from UTF-8 bytes and returns the byte offset where text begins.
     /// Does NOT allocate a string — caller decides when and how to materialize the text.
-    /// Used together with <see cref="TextPool"/> for zero-allocation deduplication.
+    /// Uses <see cref="SearchValues{T}"/> for SIMD-accelerated separator detection.
     /// </summary>
+    [SkipLocalsInit]
     public static long ParseNumberUtf8(ReadOnlySpan<byte> utf8Line, out int textStartOffset)
     {
-        var sepIdx = utf8Line.IndexOf(SeparatorUtf8);
-        if (sepIdx < 1)
-            throw new FormatException("Invalid line format, expected '<Number>. <Text>'");
+        var dotIdx = FindSeparatorDot(utf8Line);
 
-        if (!Utf8Parser.TryParse(utf8Line[..sepIdx], out long number, out _))
+        if (!Utf8Parser.TryParse(utf8Line[..dotIdx], out long number, out _))
             throw new FormatException("Failed to parse number from UTF-8 line");
 
-        textStartOffset = sepIdx + SeparatorUtf8.Length;
+        textStartOffset = dotIdx + 2; // skip ". "
         return number;
+    }
+
+    /// <summary>
+    /// Finds the separator dot using SIMD-accelerated <see cref="SearchValues{T}"/>.
+    /// The number part is digits only, so the first '.' is always the separator.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int FindSeparatorDot(ReadOnlySpan<byte> utf8Line)
+    {
+        var dotIdx = utf8Line.IndexOfAny(DotByte);
+        if (dotIdx < 1 || dotIdx + 1 >= utf8Line.Length || utf8Line[dotIdx + 1] != (byte)' ')
+            throw new FormatException("Invalid line format, expected '<Number>. <Text>'");
+        return dotIdx;
     }
 
     public static string Format(in LineEntry entry) => entry.ToString();

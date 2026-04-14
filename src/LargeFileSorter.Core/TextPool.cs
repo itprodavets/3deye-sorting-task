@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Runtime.CompilerServices;
 using System.Text;
 
 namespace LargeFileSorter.Core;
@@ -13,7 +14,11 @@ namespace LargeFileSorter.Core;
 /// TextPool avoids this: it decodes UTF-8 bytes into a stack-allocated char buffer,
 /// looks up the dictionary by <see cref="ReadOnlySpan{T}"/> (no string allocation),
 /// and only calls <c>new string(...)</c> for genuinely new text values.
+///
+/// <see cref="SkipLocalsInitAttribute"/> prevents the JIT from zeroing the stackalloc buffer
+/// (up to 1 KB per call), saving a memset on every invocation.
 /// </summary>
+[SkipLocalsInit]
 internal sealed class TextPool
 {
     private readonly Dictionary<string, string> _pool;

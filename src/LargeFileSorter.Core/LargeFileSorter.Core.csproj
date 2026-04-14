@@ -2,6 +2,10 @@
 
   <PropertyGroup>
     <RootNamespace>LargeFileSorter.Core</RootNamespace>
+    <!-- Required for [SkipLocalsInit] — prevents JIT from zeroing stack locals
+         on hot paths (TextPool.Intern, Utf8LineWriter.WriteEntry, LineEntry.CompareTo).
+         All affected methods are verified safe: locals are always written before read. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>
