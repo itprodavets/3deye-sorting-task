@@ -8,7 +8,11 @@ namespace LargeFileSorter.Core;
 /// Stores a precomputed sort key (first 4 chars of Text encoded as big-endian ulong)
 /// so that ~80% of comparisons are resolved by a single integer compare,
 /// avoiding the full string.Compare call in the hot sort path.
+///
+/// <see cref="SkipLocalsInitAttribute"/> — CompareTo is the innermost loop of the sort;
+/// even saving a few nanoseconds per call matters across hundreds of millions of invocations.
 /// </summary>
+[SkipLocalsInit]
 public readonly struct LineEntry : IComparable<LineEntry>, IEquatable<LineEntry>
 {
     public long Number { get; }

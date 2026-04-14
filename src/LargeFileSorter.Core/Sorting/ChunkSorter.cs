@@ -1,10 +1,17 @@
+using System.Runtime.CompilerServices;
+
 namespace LargeFileSorter.Core;
 
 /// <summary>
 /// Sorts a chunk of LineEntry records in-place.
 /// Uses parallel segment sorting + k-way merge for large chunks
 /// to take advantage of multiple CPU cores.
+///
+/// Uses <see cref="MemoryExtensions.Sort{T}(Span{T})"/> instead of
+/// <see cref="Array.Sort{T}(T[], int, int)"/> — Span-based sort avoids
+/// array bounds validation overhead on every call.
 /// </summary>
+[SkipLocalsInit]
 internal static class ChunkSorter
 {
     private const int ParallelThreshold = 50_000;
@@ -21,7 +28,7 @@ internal static class ChunkSorter
     {
         if (count < ParallelThreshold)
         {
-            Array.Sort(data, 0, count);
+            data.AsSpan(0, count).Sort();
             return;
         }
 
@@ -34,7 +41,7 @@ internal static class ChunkSorter
         {
             var start = i * segSize;
             var len = (i == segCount - 1) ? count - start : segSize;
-            Array.Sort(data, start, len);
+            data.AsSpan(start, len).Sort();
         });
 
         MergeSortedSegments(data, count, segCount, segSize);
