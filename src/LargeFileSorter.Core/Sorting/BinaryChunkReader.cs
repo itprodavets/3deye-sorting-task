@@ -10,6 +10,7 @@ namespace LargeFileSorter.Core;
 internal sealed class BinaryChunkReader : IChunkReader
 {
     private const int BatchSize = 8192;
+    private static readonly UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
 
     private readonly BinaryReader _reader;
     private readonly LineEntry[] _buffer = new LineEntry[BatchSize];
@@ -21,7 +22,7 @@ internal sealed class BinaryChunkReader : IChunkReader
     {
         var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
             FileShare.Read, ioBufferSize, FileOptions.SequentialScan);
-        _reader = new BinaryReader(stream, new UTF8Encoding(false), leaveOpen: false);
+        _reader = new BinaryReader(stream, Utf8NoBom, leaveOpen: false);
         Refill();
     }
 
