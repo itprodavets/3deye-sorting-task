@@ -32,7 +32,8 @@ print_menu() {
     echo -e "  ${CYAN}4)${NC} Run tests"
     echo -e "  ${CYAN}5)${NC} Run benchmarks"
     echo -e "  ${CYAN}6)${NC} Build solution"
-    echo -e "  ${CYAN}7)${NC} Clean build artifacts"
+    echo -e "  ${CYAN}7)${NC} Publish native binaries (NativeAOT)"
+    echo -e "  ${CYAN}8)${NC} Clean build artifacts"
     echo -e "  ${CYAN}0)${NC} Exit"
     echo ""
 }
@@ -148,11 +149,14 @@ do_sort() {
     local merge_width
     merge_width=$(read_input "Merge width" "64")
 
+    local strategy
+    strategy=$(read_input "Strategy (stream, mmf, auto)" "auto")
+
     echo ""
     echo -e "  ${GREEN}Sorting...${NC}"
     echo ""
 
-    local cmd="dotnet run --project $SORTER_PROJECT -c Release -- \"$input\" \"$output\" --merge-width $merge_width"
+    local cmd="dotnet run --project $SORTER_PROJECT -c Release -- \"$input\" \"$output\" --merge-width $merge_width --strategy $strategy"
     if [ "$memory" != "auto" ]; then
         cmd="$cmd --memory $memory"
     fi
@@ -228,9 +232,25 @@ do_test() {
 
 do_benchmark() {
     echo ""
+    echo -e "  ${BOLD}--- Benchmarks ---${NC}"
+    echo ""
+    echo -e "  ${CYAN}1)${NC} Strategy comparison (stream vs mmf)"
+    echo -e "  ${CYAN}2)${NC} Approach comparison (naive vs sequential vs optimized)"
+    echo -e "  ${CYAN}3)${NC} Run all benchmarks"
+    echo ""
+    local choice
+    choice=$(read_input "Select benchmark" "1")
+
+    echo ""
     echo -e "  ${YELLOW}Running benchmarks (this may take several minutes)...${NC}"
     echo ""
-    dotnet run --project $BENCHMARK_PROJECT -c Release
+
+    case "$choice" in
+        1) dotnet run --project $BENCHMARK_PROJECT -c Release -- --filter '*Strategy*' ;;
+        2) dotnet run --project $BENCHMARK_PROJECT -c Release -- --filter '*Sorting*' ;;
+        3) dotnet run --project $BENCHMARK_PROJECT -c Release -- --filter '*' ;;
+        *) echo -e "  ${RED}Invalid option.${NC}" ;;
+    esac
 }
 
 do_build() {
@@ -240,6 +260,69 @@ do_build() {
     dotnet build -c Release
     echo ""
     echo -e "  ${GREEN}Build complete.${NC}"
+}
+
+do_publish_native() {
+    echo ""
+    echo -e "  ${BOLD}--- Publish Native Binaries (NativeAOT) ---${NC}"
+    echo ""
+
+    # Detect runtime identifier
+    local arch
+    arch=$(uname -m)
+    local os
+    os=$(uname -s)
+
+    local rid
+    case "$os" in
+        Darwin)
+            case "$arch" in
+                arm64) rid="osx-arm64" ;;
+                x86_64) rid="osx-x64" ;;
+                *) rid="osx-arm64" ;;
+            esac
+            ;;
+        Linux)
+            case "$arch" in
+                aarch64) rid="linux-arm64" ;;
+                x86_64) rid="linux-x64" ;;
+                *) rid="linux-x64" ;;
+            esac
+            ;;
+        *)
+            rid="win-x64"
+            ;;
+    esac
+
+    local output_dir
+    output_dir=$(read_input "Output directory" "$SCRIPT_DIR/publish")
+
+    echo -e "  ${CYAN}Runtime:${NC} $rid"
+    echo ""
+
+    mkdir -p "$output_dir"
+
+    echo -e "  ${GREEN}Publishing Sorter...${NC}"
+    dotnet publish $SORTER_PROJECT -c Release -r "$rid" /p:PublishAot=true -o "$output_dir" 2>&1
+
+    echo ""
+    echo -e "  ${GREEN}Publishing Generator...${NC}"
+    dotnet publish $GENERATOR_PROJECT -c Release -r "$rid" /p:PublishAot=true -o "$output_dir" 2>&1
+
+    echo ""
+    if [ -f "$output_dir/LargeFileSorter.Sorter" ]; then
+        local sorter_size generator_size
+        sorter_size=$(wc -c < "$output_dir/LargeFileSorter.Sorter" | tr -d ' ')
+        echo -e "  ${GREEN}Sorter:${NC}    $output_dir/LargeFileSorter.Sorter ($(format_size_human "$sorter_size"))"
+    fi
+    if [ -f "$output_dir/LargeFileSorter.Generator" ]; then
+        generator_size=$(wc -c < "$output_dir/LargeFileSorter.Generator" | tr -d ' ')
+        echo -e "  ${GREEN}Generator:${NC} $output_dir/LargeFileSorter.Generator ($(format_size_human "$generator_size"))"
+    fi
+    echo ""
+    echo -e "  ${CYAN}Usage:${NC}"
+    echo -e "    $output_dir/LargeFileSorter.Generator data/test.txt 1GB"
+    echo -e "    $output_dir/LargeFileSorter.Sorter data/test.txt data/sorted.txt"
 }
 
 do_clean() {
@@ -277,7 +360,8 @@ while true; do
         4) do_test ;;
         5) do_benchmark ;;
         6) do_build ;;
-        7) do_clean ;;
+        7) do_publish_native ;;
+        8) do_clean ;;
         0|q|Q) echo -e "\n  ${GREEN}Bye!${NC}\n"; exit 0 ;;
         *) echo -e "\n  ${RED}Invalid option.${NC}" ;;
     esac

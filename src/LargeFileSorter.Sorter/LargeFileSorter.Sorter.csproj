@@ -10,6 +10,13 @@
     <!-- Keep committed memory after GC instead of decommitting, so the next
          chunk allocation reuses the same pages without a kernel call -->
     <RetainVMGarbageCollection>true</RetainVMGarbageCollection>
+    <!-- NativeAOT: ahead-of-time compilation for instant startup and smaller footprint.
+         Publish with: dotnet publish -c Release -r <rid> /p:PublishAot=true
+         The flag is opt-in per publish — regular 'dotnet run' still uses JIT. -->
+    <IsAotCompatible>true</IsAotCompatible>
+    <PublishAot Condition="'$(PublishAot)' == 'true'">true</PublishAot>
+    <StripSymbols Condition="'$(PublishAot)' == 'true'">true</StripSymbols>
+    <OptimizationPreference Condition="'$(PublishAot)' == 'true'">Speed</OptimizationPreference>
   </PropertyGroup>
 
   <ItemGroup>
