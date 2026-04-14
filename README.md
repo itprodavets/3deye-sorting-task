@@ -14,8 +14,10 @@ Sort a text file where each line follows the format `<Number>. <String>`:
 src/
   LargeFileSorter.Core/
     Abstractions/              Interfaces (IFileSorter, IFileGenerator, IChunkReader)
-    Sorting/                   Sort pipeline (ExternalSorter, ChunkSorter, ChunkMerger,
-                               BinaryChunkReader, BinaryChunkWriter, Utf8LineWriter)
+    Sorting/                   Sort pipeline (ExternalSorter, MmfSorter, ChunkSorter,
+                               ChunkMerger, BinaryChunkReader, BinaryChunkWriter, Utf8LineWriter)
+    EntryIndex.cs              File offset index (28 bytes, no managed refs, NativeMemory)
+    NativeBuffer.cs            Growable array via NativeMemory.AlignedAlloc (GC-invisible)
     LineEntry.cs               Core model with precomputed sort key
     LineParser.cs              UTF-8 & string parsing
     TextPool.cs                Zero-allocation string interning (AlternateLookup)
@@ -127,6 +129,7 @@ dotnet run --project src/LargeFileSorter.Sorter -- <input-file> <output-file>
 | `--workers <num>` | auto (1–4) | Number of concurrent sort workers |
 | `--merge-width <num>` | 64 | Max files to merge in a single pass |
 | `--temp-dir <path>` | system temp | Directory for temporary chunk files |
+| `--strategy <name>` | auto | Sort strategy: `stream`, `mmf`, `auto` |
 
 **Examples:**
 
@@ -144,6 +147,10 @@ dotnet run --project src/LargeFileSorter.Sorter -- data/test.txt data/sorted.txt
 
 # Release mode for best performance (recommended for large files)
 dotnet run --project src/LargeFileSorter.Sorter -c Release -- data/test.txt data/sorted.txt
+
+# Force memory-mapped strategy (NativeMemory + MMF, zero managed allocations)
+dotnet run --project src/LargeFileSorter.Sorter -c Release -- data/test.txt data/sorted.txt \
+    --strategy mmf
 ```
 
 **Example output (64 GB machine):**
@@ -296,6 +303,18 @@ Larger I/O buffers reduce syscall overhead on NVMe SSDs (peak sequential through
 
 Disk space is validated before sorting starts — the sorter requires at least 1.2× the input file size as free space in the temp directory.
 
+### Sort Strategies
+
+Two `IFileSorter` implementations (Strategy pattern), selectable via `--strategy`:
+
+| Strategy | Flag | When to use | How it works |
+|----------|------|-------------|--------------|
+| **stream** | `--strategy stream` | High-throughput (default for large files) | PipeReader → `TextPool` string dedup → `Channel<T>` → parallel sort → binary chunks |
+| **mmf** | `--strategy mmf` | Zero managed allocations | `MemoryMappedFile` → `NativeBuffer<EntryIndex>` (NativeMemory) → pointer-based sort → binary chunks |
+| **auto** | `--strategy auto` (default) | Best of both | File ≤ chunk budget → MMF; larger → stream pipeline |
+
+The stream strategy excels on data with repeating text (string dedup via `TextPool` keeps unique count low). The MMF strategy excels on high-cardinality data where millions of unique strings would cause GC pressure.
+
 ### Performance Tuning
 
 | Parameter       | Flag             | Default | Effect                                        |
@@ -375,7 +394,7 @@ The codebase follows **SOLID** principles:
 | Principle | Implementation |
 |-----------|---------------|
 | **Single Responsibility** | `ExternalSorter` orchestrates; `ChunkSorter`, `ChunkMerger`, `BinaryChunkReader`, `BinaryChunkWriter` each handle one concern; `TextPool` owns string deduplication; `Utf8LineWriter` owns UTF-8 output formatting; `SizeFormatter` centralizes size formatting; `HardwareProfile` encapsulates diagnostics |
-| **Open/Closed** | New sort strategies can implement `IFileSorter`; new chunk formats can implement `IChunkReader` |
+| **Open/Closed** | `ExternalSorter` and `MmfSorter` implement `IFileSorter` — new strategies added without modifying existing code; new chunk formats implement `IChunkReader` |
 | **Liskov Substitution** | All interface implementations honor their contracts |
 | **Interface Segregation** | `IFileSorter` (sort), `IFileGenerator` (generate), `IChunkReader` (read) — each focused on one operation |
 | **Dependency Inversion** | `ChunkMerger` depends on `Func<string, IChunkReader>` factory, not concrete `BinaryChunkReader` |
