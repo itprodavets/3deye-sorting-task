@@ -237,9 +237,9 @@ The sorter uses a two-phase **external merge sort**:
 
 ### Phase 1 — Split & Sort (concurrent pipeline)
 1. A **reader task** reads the input file using `System.IO.Pipelines` (`PipeReader`), parsing lines directly from UTF-8 byte buffers — no per-line string allocation for the full line.
-2. Lines are parsed via `Utf8Parser.TryParse` + `Encoding.UTF8.GetString` — only the `Text` portion becomes a managed string.
+2. Separator detection uses `SearchValues<byte>` (.NET 8+) for SIMD-accelerated dot search; numbers are parsed via `Utf8Parser.TryParse` — only the `Text` portion becomes a managed string.
 3. Filled chunks are sent through a **bounded `Channel`** to 1–4 sort workers — reader and sort workers run concurrently, overlapping disk I/O and CPU.
-4. Each sort worker uses **parallel merge sort**: splits the chunk into segments, sorts each via `Parallel.For` (with `MaxDegreeOfParallelism` to prevent oversubscription), then k-way merges the sorted segments via `PriorityQueue`.
+4. Each sort worker uses **parallel merge sort**: splits the chunk into segments, sorts each via `Span<T>.Sort()` inside `Parallel.For` (with `MaxDegreeOfParallelism` to prevent oversubscription), then k-way merges the sorted segments via `PriorityQueue`.
 5. Sorted chunks are written to temp files in **binary format** (`BinaryWriter`: `Int64` + length-prefixed UTF-8 string) — eliminates text re-parsing during the merge phase.
 6. Chunk arrays are returned to a **custom `ArrayPool<LineEntry>`** (max 32M elements) after writing. The default `Shared` pool silently drops arrays > 1M elements, so a dedicated pool is required for actual reuse.
 7. **Zero-allocation string deduplication** via `TextPool` — uses .NET 9+ `Dictionary.GetAlternateLookup<ReadOnlySpan<char>>` to check for duplicate text without allocating a string first. `stackalloc` is used for the UTF-8 → char conversion when text is ≤ 512 chars; larger text rents from `ArrayPool<char>`. Memory estimation counts string bytes only on first occurrence, resulting in fewer, larger chunks and less merge overhead.
@@ -264,6 +264,9 @@ The sorter uses a two-phase **external merge sort**:
 | GC.Collect between phases | Hint to reclaim Phase 1 allocations before I/O-heavy merge |
 | TieredPGO | JIT re-compiles hot methods using runtime profiling data |
 | AggressiveInlining | CompareTo inlined into sort inner loop |
+| `[SkipLocalsInit]` | No stack zeroing on hot paths (TextPool, Utf8LineWriter, LineEntry, ChunkSorter) |
+| `SearchValues<byte>` | SIMD-accelerated separator search — SSE2/AVX2/AVX-512 per platform |
+| `Span<T>.Sort()` | Span-based sort avoids Array.Sort bounds validation overhead |
 | ThreadPool pre-warm | SetMinThreads = ProcessorCount to avoid injection stall |
 
 ### Memory Management
@@ -346,6 +349,9 @@ PipeReader + binary chunks + concurrent pipeline + parallel sort + sort key + GC
 | 1–4 concurrent sort workers with parallel intra-chunk sort | |
 | Custom ArrayPool (32M max) — actual reuse of large arrays | |
 | Buffered binary merge (8K records/batch) — fewer syscalls | |
+| `SearchValues<byte>` SIMD separator search — platform-optimal vectorization | |
+| `[SkipLocalsInit]` on hot paths — no JIT stack zeroing overhead | |
+| `Span<T>.Sort()` — no Array.Sort bounds checks | |
 | Server GC + SustainedLowLatency + RetainVM — minimal pauses | |
 | Auto-tuned chunk size (~25% of RAM, capped per machine) | |
 | Auto-scaled I/O buffers (1–16 MB based on available RAM) | |
