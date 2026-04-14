@@ -11,6 +11,7 @@ if (args.Length < 2)
     Console.WriteLine("  --temp-dir <path>     Directory for temporary files");
     Console.WriteLine("  --buffer <size>       I/O buffer size, e.g. 1MB, 4MB (default: auto)");
     Console.WriteLine("  --workers <num>       Concurrent sort workers (default: auto)");
+    Console.WriteLine("  --strategy <name>     Sort strategy: stream, mmf, auto (default: auto)");
     return 1;
 }
 
@@ -24,10 +25,14 @@ if (!File.Exists(inputPath))
 }
 
 var options = new SortOptions();
+var strategy = "auto";
 for (var i = 2; i < args.Length - 1; i++)
 {
     switch (args[i])
     {
+        case "--strategy":
+            strategy = args[++i].ToLowerInvariant();
+            break;
         case "--memory":
             options = new SortOptions
             {
@@ -92,6 +97,20 @@ Console.WriteLine($"Chunk memory budget: {SizeFormatter.Format(options.MaxMemory
 Console.WriteLine($"I/O buffer: {SizeFormatter.Format(options.BufferSize)}");
 Console.WriteLine($"Sort workers: {options.SortWorkers}");
 Console.WriteLine($"Merge width: {options.MergeWidth}");
+
+// Strategy selection: mmf (memory-mapped, native memory), stream (PipeReader), auto (pick best)
+IFileSorter sorter = strategy switch
+{
+    "mmf" => new MmfSorter(options),
+    "stream" => new ExternalSorter(options),
+    "auto" => inputInfo.Length <= options.MaxMemoryPerChunk
+        ? new MmfSorter(options)  // file fits in one chunk → MMF is optimal
+        : new ExternalSorter(options), // multi-chunk → stream pipeline is better
+    _ => throw new ArgumentException($"Unknown strategy: {strategy}. Use: stream, mmf, auto")
+};
+
+var strategyName = sorter is MmfSorter ? "mmf (memory-mapped + native memory)" : "stream (PipeReader + Channel)";
+Console.WriteLine($"Strategy: {strategyName}");
 Console.WriteLine();
 
 var progress = new Progress<string>(msg => Console.WriteLine(msg));
@@ -108,7 +127,6 @@ var sw = Stopwatch.StartNew();
 
 try
 {
-    var sorter = new ExternalSorter(options);
     await sorter.SortAsync(inputPath, outputPath, progress, cts.Token);
 }
 catch (OperationCanceledException)
