@@ -55,3 +55,6 @@ Thumbs.db
 ## Temp/generated test files
 *.generated.txt
 data/
+
+## NativeAOT publish output
+publish/

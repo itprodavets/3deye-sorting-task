@@ -198,10 +198,39 @@ dotnet test --verbosity normal
 
 ### 5. Run benchmarks
 
-Compares naive in-memory sort, sequential external sort, and optimized external sort:
+Compares sorting strategies and approaches:
 
 ```bash
-dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release
+# Strategy comparison: stream vs mmf
+dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release -- --filter '*Strategy*'
+
+# Approach comparison: naive vs sequential vs optimized
+dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release -- --filter '*Sorting*'
+
+# Run all benchmarks
+dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release -- --filter '*'
+```
+
+### 6. Publish native binaries (NativeAOT)
+
+Ahead-of-time compilation produces a self-contained native binary — no .NET runtime required, ~5 ms startup, ~2.7 MB binary size.
+
+```bash
+# Auto-detect platform (macOS/Linux/Windows, arm64/x64)
+./run.sh  # option 7
+
+# Or manually:
+dotnet publish src/LargeFileSorter.Sorter -c Release -r osx-arm64 /p:PublishAot=true -o publish/
+dotnet publish src/LargeFileSorter.Generator -c Release -r osx-arm64 /p:PublishAot=true -o publish/
+```
+
+**Supported runtime identifiers:** `osx-arm64`, `osx-x64`, `linux-arm64`, `linux-x64`, `win-x64`, `win-arm64`.
+
+**Run the native binaries directly — no `dotnet` needed:**
+
+```bash
+./publish/LargeFileSorter.Generator data/test.txt 1GB --seed 42
+./publish/LargeFileSorter.Sorter data/test.txt data/sorted.txt --strategy mmf
 ```
 
 ### Cancellation
@@ -217,16 +246,62 @@ Measured on Apple M4 Max (16 cores), 64 GB RAM, macOS, .NET 10.
 | File Size | Lines | Chunks | Time | Throughput |
 |-----------|-------|--------|------|------------|
 | 1 GB | 44.6 M | 1 (single chunk) | 7.6 s | 134 MB/s |
-| 1 GB | 44.6 M | 6 (256 MB chunks) | 6.6 s | 156 MB/s |
+| 1 GB | 44.6 M | 6 (256 MB chunks) | 6.3 s | 162 MB/s |
 | 5 GB | 222.8 M | 4 (2 GB chunks) | 29.6 s | 173 MB/s |
 
 > Extrapolated: **100 GB in ~10 minutes** at sustained 173 MB/s.
+
+### Strategy Comparison: Stream vs MMF
+
+Both strategies produce **byte-identical output** (verified with MD5). The table below compares sort time (excluding JIT warmup) on the same data:
+
+**Single chunk (file fits in memory budget):**
+
+| File Size | Phrases | Stream (JIT) | MMF (JIT) | Stream (AOT) | MMF (AOT) |
+|-----------|---------|-------------|-----------|-------------|-----------|
+| 200 MB | 500 | 2.19 s | 2.09 s | 2.76 s | **1.92 s** |
+| 200 MB | 10,000 | 2.21 s | **2.14 s** | — | — |
+| 1 GB | 500 | **7.66 s** | 9.63 s | 9.13 s | 10.44 s |
+
+**Multi-chunk (6 chunks × 256 MB from 1 GB file):**
+
+| Runtime | Stream | MMF | Winner |
+|---------|--------|-----|--------|
+| JIT | **6.33 s** (162 MB/s) | 10.42 s (98 MB/s) | Stream 1.65x |
+| AOT | **7.06 s** (145 MB/s) | 11.29 s (91 MB/s) | Stream 1.60x |
+
+**When to use which:**
+
+| Scenario | Best Strategy | Why |
+|----------|--------------|-----|
+| Low-cardinality text (few unique phrases) | **Stream** | `TextPool` deduplicates strings; comparisons become pointer equality |
+| High-cardinality text (many unique strings) | **MMF** | No `TextPool` overhead; 8-byte sort key resolves 90%+ without memory access |
+| Small files (single chunk, < 500 MB) | **MMF** | Less overhead; no pipeline setup; zero GC pressure |
+| Large files (multi-chunk, > 1 GB) | **Stream** | Concurrent pipeline overlaps I/O and sort; `Channel<T>` keeps all cores busy |
+| Latency-sensitive (GC pauses unacceptable) | **MMF** | `NativeBuffer<EntryIndex>` is invisible to GC — zero pauses regardless of size |
+
+The `auto` strategy (default) picks MMF when the file fits in a single chunk, and stream otherwise. This matches the benchmarks: MMF avoids pipeline overhead for small files, while stream's concurrent pipeline dominates on large multi-chunk workloads.
+
+### JIT vs NativeAOT
+
+| Metric | JIT (.NET 10) | NativeAOT |
+|--------|--------------|-----------|
+| Startup time | ~680 ms | **~5 ms** (136x faster) |
+| Binary size | ~97 MB (with runtime) | **2.7 MB** (36x smaller) |
+| 200 MB sort (mmf) | 2.09 s | **1.92 s** (8% faster) |
+| 1 GB sort (stream) | **7.66 s** | 9.13 s (16% slower) |
+| 1 GB multi-chunk (stream) | **6.33 s** | 7.06 s (10% slower) |
+| Runtime optimization | TieredPGO re-compiles hot loops | Static compilation, no profiling |
+
+**Recommendation:** Use **JIT for large files** — TieredPGO optimizes the sort comparison loop with runtime profiling data, giving 10–16% better throughput on sustained workloads. Use **NativeAOT for deployment** where instant startup and small binary size matter (containers, CLI tools, serverless).
 
 ### Correctness Verification
 
 - **Line count**: input and output always match exactly.
 - **Determinism**: single-chunk and multi-chunk modes produce **byte-identical** output.
 - **Sort order**: verified alphabetical primary sort, numerical secondary sort.
+- **Strategies**: stream and MMF produce **byte-identical** output for the same input.
+- **Runtimes**: JIT and NativeAOT produce **byte-identical** output.
 - **No BOM**: output is clean UTF-8 without byte order mark.
 
 ### Resource Usage
@@ -313,7 +388,7 @@ Two `IFileSorter` implementations (Strategy pattern), selectable via `--strategy
 | **mmf** | `--strategy mmf` | Zero managed allocations | `MemoryMappedFile` → `NativeBuffer<EntryIndex>` (NativeMemory) → pointer-based sort → binary chunks |
 | **auto** | `--strategy auto` (default) | Best of both | File ≤ chunk budget → MMF; larger → stream pipeline |
 
-The stream strategy excels on data with repeating text (string dedup via `TextPool` keeps unique count low). The MMF strategy excels on high-cardinality data where millions of unique strings would cause GC pressure.
+The stream strategy excels on data with repeating text (string dedup via `TextPool` keeps unique count low) and multi-chunk workloads (concurrent pipeline). The MMF strategy excels on small files that fit in one chunk and on high-cardinality data where millions of unique strings would cause GC pressure. See [Strategy Comparison](#strategy-comparison-stream-vs-mmf) for detailed benchmarks.
 
 ### Performance Tuning
 
@@ -352,29 +427,37 @@ Read chunks → sort one at a time → write temp files → merge.
 | | `ToString()` allocation per line on writes |
 | | No array pooling — LOH allocation per chunk |
 
-### 3. Optimized External Sort (this implementation)
+### 3. Optimized External Sort — Stream Strategy (PipeReader + Channel)
 
 PipeReader + binary chunks + concurrent pipeline + parallel sort + sort key + GC tuning.
 
 | Pros | Cons |
 |------|------|
 | 173 MB/s on 5 GB — **~10 min for 100 GB** | More complex implementation |
-| PipeReader — zero per-line allocation for input parsing | |
-| UTF-8 byte parsing — avoids full-line string materialization | |
+| PipeReader — zero per-line allocation for input parsing | String dedup less effective for high-cardinality data |
 | Zero-allocation string deduplication via `AlternateLookup` (.NET 9+) | |
-| Direct UTF-8 output (`Utf8Formatter`) — no `long.ToString()` alloc | |
-| Binary chunk format — no text re-parsing during merge | |
-| Precomputed sort key — ~80% of comparisons via single ulong | |
-| 1–4 concurrent sort workers with parallel intra-chunk sort | |
+| Concurrent pipeline — I/O and sort overlap via `Channel<T>` | |
+| 1–4 sort workers with parallel intra-chunk sort | |
 | Custom ArrayPool (32M max) — actual reuse of large arrays | |
-| Buffered binary merge (8K records/batch) — fewer syscalls | |
-| `SearchValues<byte>` SIMD separator search — platform-optimal vectorization | |
-| `[SkipLocalsInit]` on hot paths — no JIT stack zeroing overhead | |
-| `Span<T>.Sort()` — no Array.Sort bounds checks | |
-| Server GC + SustainedLowLatency + RetainVM — minimal pauses | |
-| Auto-tuned chunk size (~25% of RAM, capped per machine) | |
-| Auto-scaled I/O buffers (1–16 MB based on available RAM) | |
-| Disk space validation before sort starts | |
+| Precomputed sort key — ~80% of comparisons via single ulong | |
+| `SearchValues<byte>` SIMD separator search | |
+| `[SkipLocalsInit]` on hot paths — no JIT stack zeroing | |
+| Auto-tuned to hardware (chunk size, I/O buffers, workers) | |
+
+### 4. Optimized External Sort — MMF Strategy (MemoryMappedFile + NativeMemory)
+
+MemoryMappedFile + NativeBuffer&lt;EntryIndex&gt; + pointer-based sort + zero managed allocations.
+
+| Pros | Cons |
+|------|------|
+| **Zero managed allocations** during sort — GC never sees the data | Sequential chunk processing (no concurrent pipeline) |
+| `NativeBuffer<EntryIndex>` — 28-byte structs in native memory | No string deduplication — every comparison reads file bytes |
+| 8-byte UTF-8 prefix sort key — 90%+ resolved without MMF access | Slower on low-cardinality data where TextPool wins |
+| `MemoryMappedFile` — OS manages page cache, no explicit reads | |
+| `[SkipLocalsInit]` + `SearchValues<byte>` on hot paths | |
+| Zero GC pauses regardless of data size or cardinality | |
+| NativeAOT-friendly — no reflection, no dynamic code | |
+| Binary chunk output — reuses same `ChunkMerger` for merge phase | |
 
 ### Why external merge sort?
 
