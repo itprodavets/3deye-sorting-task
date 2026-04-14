@@ -139,6 +139,12 @@ do_sort() {
     local memory
     memory=$(read_input "Chunk memory (e.g. 256MB, 1GB, auto)" "auto")
 
+    local buffer
+    buffer=$(read_input "I/O buffer size (e.g. 1MB, 4MB, auto)" "auto")
+
+    local workers
+    workers=$(read_input "Sort workers (1-4, auto)" "auto")
+
     local merge_width
     merge_width=$(read_input "Merge width" "64")
 
@@ -149,6 +155,12 @@ do_sort() {
     local cmd="dotnet run --project $SORTER_PROJECT -c Release -- \"$input\" \"$output\" --merge-width $merge_width"
     if [ "$memory" != "auto" ]; then
         cmd="$cmd --memory $memory"
+    fi
+    if [ "$buffer" != "auto" ]; then
+        cmd="$cmd --buffer $buffer"
+    fi
+    if [ "$workers" != "auto" ]; then
+        cmd="$cmd --workers $workers"
     fi
 
     eval "$cmd"
