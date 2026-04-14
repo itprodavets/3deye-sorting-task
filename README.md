@@ -15,9 +15,10 @@ src/
   LargeFileSorter.Core/
     Abstractions/              Interfaces (IFileSorter, IFileGenerator, IChunkReader)
     Sorting/                   Sort pipeline (ExternalSorter, ChunkSorter, ChunkMerger,
-                               BinaryChunkReader, BinaryChunkWriter)
+                               BinaryChunkReader, BinaryChunkWriter, Utf8LineWriter)
     LineEntry.cs               Core model with precomputed sort key
     LineParser.cs              UTF-8 & string parsing
+    TextPool.cs                Zero-allocation string interning (AlternateLookup)
     SortOptions.cs             Configuration + HardwareProfile (auto-tuning)
     SizeFormatter.cs           Shared byte-size formatting utility
     GeneratorOptions.cs        Generator configuration
@@ -158,13 +159,14 @@ Sort workers: 4
 Merge width: 64
 
 Phase 1: splitting and sorting chunks...
-  chunk 0: 22,450,000 lines queued
-  chunk 1: 22,450,000 lines queued
-  ...
+  chunk 0: 67,107,899 lines queued
+  chunk 1: 67,107,899 lines queued
+  chunk 2: 67,107,899 lines queued
+  chunk 3: 21,496,295 lines (final)
 Phase 2: merging 4 sorted chunks...
 Done.
 
-Completed in 00:00:36.200
+Completed in 00:00:29.626
 Output size: 5.0 GB
 ```
 
@@ -207,11 +209,11 @@ Measured on Apple M4 Max (16 cores), 64 GB RAM, macOS, .NET 10.
 
 | File Size | Lines | Chunks | Time | Throughput |
 |-----------|-------|--------|------|------------|
-| 1 GB | 44.5 M | 1 (single chunk) | 8.0 s | 128 MB/s |
-| 1 GB | 44.5 M | 6 (256 MB chunks) | 7.8 s | 131 MB/s |
-| 5 GB | 224.5 M | 4 (2 GB chunks) | 36.2 s | 141 MB/s |
+| 1 GB | 44.6 M | 1 (single chunk) | 7.6 s | 134 MB/s |
+| 1 GB | 44.6 M | 6 (256 MB chunks) | 6.6 s | 156 MB/s |
+| 5 GB | 222.8 M | 4 (2 GB chunks) | 29.6 s | 173 MB/s |
 
-> Extrapolated: **100 GB in ~12 minutes** at sustained 141 MB/s.
+> Extrapolated: **100 GB in ~10 minutes** at sustained 173 MB/s.
 
 ### Correctness Verification
 
@@ -240,12 +242,12 @@ The sorter uses a two-phase **external merge sort**:
 4. Each sort worker uses **parallel merge sort**: splits the chunk into segments, sorts each via `Parallel.For` (with `MaxDegreeOfParallelism` to prevent oversubscription), then k-way merges the sorted segments via `PriorityQueue`.
 5. Sorted chunks are written to temp files in **binary format** (`BinaryWriter`: `Int64` + length-prefixed UTF-8 string) — eliminates text re-parsing during the merge phase.
 6. Chunk arrays are returned to a **custom `ArrayPool<LineEntry>`** (max 32M elements) after writing. The default `Shared` pool silently drops arrays > 1M elements, so a dedicated pool is required for actual reuse.
-7. String deduplication via a per-chunk dictionary avoids storing multiple copies of the same text in memory. Memory estimation only counts string bytes on first occurrence, resulting in fewer, larger chunks and less merge overhead.
+7. **Zero-allocation string deduplication** via `TextPool` — uses .NET 9+ `Dictionary.GetAlternateLookup<ReadOnlySpan<char>>` to check for duplicate text without allocating a string first. `stackalloc` is used for the UTF-8 → char conversion when text is ≤ 512 chars; larger text rents from `ArrayPool<char>`. Memory estimation counts string bytes only on first occurrence, resulting in fewer, larger chunks and less merge overhead.
 
 ### Phase 2 — K-Way Merge (buffered)
 1. Each sorted chunk is wrapped in a **`BinaryChunkReader`** that reads binary records in batches of 8,192, using `BinaryReader.ReadInt64()` + `ReadString()` — no text parsing at all.
 2. A `PriorityQueue` (min-heap) selects the smallest entry across all chunk readers.
-3. Output is written with direct formatting to avoid allocations.
+3. Output is written via `Utf8LineWriter` — formats numbers directly to UTF-8 with `Utf8Formatter.TryFormat` (no `long.ToString()` allocation), and uses a pooled byte buffer with bulk flush to minimize syscalls.
 4. If chunk count exceeds `MergeWidth`, **multi-level merging** groups chunks to stay within file handle limits.
 
 ### Comparison Optimization
@@ -268,10 +270,11 @@ The sorter uses a two-phase **external merge sort**:
 - Chunk memory budget auto-tunes to ~25% of available RAM (cap scales with machine: 1 GB on small, up to 8 GB on 64 GB+).
 - Custom `ArrayPool<LineEntry>` (32M max) reuses chunk arrays across iterations — the default `Shared` pool only handles up to ~1M elements.
 - Bounded channel (capacity = worker count) limits in-flight chunks, keeping peak memory predictable.
-- String pooling within chunks deduplicates repeated text values; memory estimation counts string bytes only once per unique text.
+- `TextPool` with `AlternateLookup<ReadOnlySpan<char>>` deduplicates strings without allocating — uses `stackalloc` for small text, `ArrayPool<char>` for large text.
+- `Utf8LineWriter` formats output directly to UTF-8 using `Utf8Formatter.TryFormat` — eliminates `long.ToString()` and StreamWriter char→byte encoding overhead.
 - PipeReader reads large blocks (auto-scaled: 1–16 MB) with zero per-line allocation for the full input line.
 - Binary chunk format avoids text re-parsing during merge — only the final output writes text.
-- All output uses `UTF8Encoding(false)` — no BOM in generated files.
+- All output uses cached `UTF8Encoding(false)` — no BOM in generated files, no per-writer allocation.
 
 ### Hardware Auto-Tuning
 
@@ -333,15 +336,16 @@ PipeReader + binary chunks + concurrent pipeline + parallel sort + sort key + GC
 
 | Pros | Cons |
 |------|------|
-| 141 MB/s on 5 GB — **~12 min for 100 GB** | More complex implementation |
+| 173 MB/s on 5 GB — **~10 min for 100 GB** | More complex implementation |
 | PipeReader — zero per-line allocation for input parsing | |
 | UTF-8 byte parsing — avoids full-line string materialization | |
+| Zero-allocation string deduplication via `AlternateLookup` (.NET 9+) | |
+| Direct UTF-8 output (`Utf8Formatter`) — no `long.ToString()` alloc | |
 | Binary chunk format — no text re-parsing during merge | |
 | Precomputed sort key — ~80% of comparisons via single ulong | |
 | 1–4 concurrent sort workers with parallel intra-chunk sort | |
 | Custom ArrayPool (32M max) — actual reuse of large arrays | |
 | Buffered binary merge (8K records/batch) — fewer syscalls | |
-| String deduplication — less memory for repeated text | |
 | Server GC + SustainedLowLatency + RetainVM — minimal pauses | |
 | Auto-tuned chunk size (~25% of RAM, capped per machine) | |
 | Auto-scaled I/O buffers (1–16 MB based on available RAM) | |
@@ -364,7 +368,7 @@ The codebase follows **SOLID** principles:
 
 | Principle | Implementation |
 |-----------|---------------|
-| **Single Responsibility** | `ExternalSorter` orchestrates; `ChunkSorter`, `ChunkMerger`, `BinaryChunkReader`, `BinaryChunkWriter` each handle one concern; `SizeFormatter` centralizes formatting; `HardwareProfile` encapsulates diagnostics |
+| **Single Responsibility** | `ExternalSorter` orchestrates; `ChunkSorter`, `ChunkMerger`, `BinaryChunkReader`, `BinaryChunkWriter` each handle one concern; `TextPool` owns string deduplication; `Utf8LineWriter` owns UTF-8 output formatting; `SizeFormatter` centralizes size formatting; `HardwareProfile` encapsulates diagnostics |
 | **Open/Closed** | New sort strategies can implement `IFileSorter`; new chunk formats can implement `IChunkReader` |
 | **Liskov Substitution** | All interface implementations honor their contracts |
 | **Interface Segregation** | `IFileSorter` (sort), `IFileGenerator` (generate), `IChunkReader` (read) — each focused on one operation |

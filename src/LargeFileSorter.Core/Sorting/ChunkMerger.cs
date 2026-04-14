@@ -2,6 +2,9 @@ using System.Text;
 
 namespace LargeFileSorter.Core;
 
+// Cached encoding instance — avoids allocating a new UTF8Encoding(false) per reader/writer.
+// Each BinaryReader/BinaryWriter was creating its own; this eliminates ~6 allocations per sort.
+
 /// <summary>
 /// K-way merge for sorted binary chunk files.
 /// Supports multi-level merging when the number of chunks exceeds the merge width.
@@ -9,6 +12,8 @@ namespace LargeFileSorter.Core;
 /// </summary>
 internal sealed class ChunkMerger
 {
+    private static readonly UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
+
     private readonly int _bufferSize;
     private readonly int _mergeWidth;
     private readonly Func<string, IChunkReader> _readerFactory;
@@ -66,7 +71,7 @@ internal sealed class ChunkMerger
 
             using var outStream = new FileStream(outputPath, FileMode.Create, FileAccess.Write,
                 FileShare.None, _bufferSize, FileOptions.SequentialScan);
-            using var bw = new BinaryWriter(outStream, new UTF8Encoding(false), leaveOpen: false);
+            using var bw = new BinaryWriter(outStream, Utf8NoBom, leaveOpen: false);
 
             while (pq.Count > 0)
             {
@@ -100,15 +105,16 @@ internal sealed class ChunkMerger
 
             using var outStream = new FileStream(outputPath, FileMode.Create, FileAccess.Write,
                 FileShare.None, _bufferSize, FileOptions.SequentialScan);
-            using var writer = new StreamWriter(outStream, new UTF8Encoding(false), _bufferSize);
+
+            // Direct UTF-8 output: Utf8Formatter for numbers, bulk buffer flush.
+            // Avoids StreamWriter's per-write char→byte encoding overhead.
+            using var writer = new Utf8LineWriter(outStream, _bufferSize);
 
             while (pq.Count > 0)
             {
                 ct.ThrowIfCancellationRequested();
                 pq.TryDequeue(out var readerIdx, out var entry);
-                writer.Write(entry.Number);
-                writer.Write(". ");
-                writer.WriteLine(entry.Text);
+                writer.WriteEntry(entry);
                 readers[readerIdx].Advance();
                 if (readers[readerIdx].HasCurrent)
                     pq.Enqueue(readerIdx, readers[readerIdx].Current);
