@@ -1,0 +1,74 @@
+name: benchmark
+
+# Runs tests + benchmarks on every push to main and commits the results back
+# between the <!-- TESTS:... --> / <!-- BENCH:... --> markers in README.md.
+#
+# Loop protection: commits created by this workflow include "[skip ci]" in the
+# message, and the workflow ignores pushes that only touch README.md.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - '.github/**'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Commit-back step needs a writable token; default GITHUB_TOKEN has
+          # contents:write via the `permissions` block above.
+          persist-credentials: true
+          fetch-depth: 1
+
+      - name: Set up .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Print environment
+        run: |
+          uname -a
+          dotnet --info
+          free -h || true
+          nproc || true
+
+      - name: Restore & build (Release)
+        run: dotnet build -c Release --nologo
+
+      - name: Run tests + benchmarks, update README
+        run: |
+          chmod +x scripts/bench.sh
+          scripts/bench.sh --readme README.md
+
+      - name: Commit README if changed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- README.md; then
+            echo "README unchanged — nothing to commit."
+            exit 0
+          fi
+          git add README.md
+          git commit -m "ci: refresh benchmark + test results in README [skip ci]"
+          # Rebase guard: the workflow is push-triggered on main; if someone else
+          # pushed between checkout and now, retry once after rebasing.
+          if ! git push origin HEAD:main; then
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
