@@ -141,7 +141,9 @@ public sealed class MmfSorter : IFileSorter
         string tempDir, IProgress<string>? progress, CancellationToken ct)
     {
         var chunkPaths = new List<string>();
-        var parallelism = Math.Max(2, Environment.ProcessorCount / _options.SortWorkers);
+        // MMF keeps one chunk in memory at a time (the mapped view), so the whole
+        // parallelism budget goes to intra-chunk segmentation — no outer worker fan-out.
+        var parallelism = Math.Max(2, _options.MaxDegreeOfParallelism);
         long pos = 0;
         var chunkIndex = 0;
 
@@ -288,7 +290,8 @@ public sealed class MmfSorter : IFileSorter
             return;
         }
 
-        var segCount = Math.Clamp(parallelism, 2, 8);
+        // No artificial cap — caller's budget is authoritative. See comment in ChunkSorter.
+        var segCount = Math.Max(2, parallelism);
         var segSize = count / segCount;
 
         Parallel.For(0, segCount, new ParallelOptions { MaxDegreeOfParallelism = segCount }, i =>

@@ -131,7 +131,8 @@ dotnet run --project src/LargeFileSorter.Sorter -- <input-file> <output-file>
 | `--workers <num>` | auto (1–4) | Number of concurrent sort workers |
 | `--merge-width <num>` | 64 | Max files to merge in a single pass |
 | `--temp-dir <path>` | system temp | Directory for temporary chunk files |
-| `--strategy <name>` | auto | Sort strategy: `stream`, `mmf`, `auto` |
+| `--strategy <name>` | auto | Sort strategy: `stream`, `mmf`, `shard`, `auto` |
+| `--threads <num>` | logical cores | Total parallelism budget shared by all strategies (workers × segments × shards). Use the same value across strategies for fair comparison. |
 
 **Examples:**
 
@@ -321,17 +322,18 @@ Verified after the run: input and output line counts match exactly (4 456 315 68
 
 ### Strategy Comparison: When to Use Which
 
-Both strategies produce **byte-identical output** (verified with MD5). Tradeoffs are qualitative rather than numeric — the CI benchmarks above show the timing for the current commit:
+All three strategies produce **byte-identical output** (verified with SHA-256 in CI). Tradeoffs are qualitative rather than numeric — the CI benchmarks above show the timing for the current commit:
 
 | Scenario | Best Strategy | Why |
 |----------|--------------|-----|
 | Low-cardinality text (few unique phrases) | **Stream** | `TextPool` deduplicates strings; comparisons become pointer equality |
 | High-cardinality text (many unique strings) | **MMF** | No `TextPool` overhead; 8-byte sort key resolves 90%+ without memory access |
 | Small files (single chunk) | **MMF** | Less overhead; no pipeline setup; zero GC pressure |
-| Large files (multi-chunk) | **Stream** | Concurrent pipeline overlaps I/O and sort; `Channel<T>` keeps all cores busy |
+| Large files (multi-chunk, modest core count) | **Stream** | Concurrent pipeline overlaps I/O and sort; `Channel<T>` keeps all cores busy |
+| Large files (multi-chunk, many cores ≥ 8) | **Shard** | Phase 1 shared with stream; Phase 2 runs K parallel k-way merges over disjoint key ranges — 8% faster on 1 GB / 86 chunks at `--threads 16` (locally measured), more on bigger inputs where merge dominates |
 | Latency-sensitive (GC pauses unacceptable) | **MMF** | `NativeBuffer<EntryIndex>` is invisible to GC — zero pauses regardless of size |
 
-The `auto` strategy (default) picks MMF when the file fits in a single chunk, and stream otherwise.
+The `auto` strategy (default) picks MMF when the file fits in a single chunk, **shard** when the input is at least 4× the chunk budget AND `--threads ≥ 4`, and stream otherwise. Force a specific strategy with `--strategy stream|mmf|shard`. Use the same `--threads N` across strategies to compare them fairly.
 
 ### JIT vs NativeAOT
 
@@ -349,7 +351,7 @@ The `auto` strategy (default) picks MMF when the file fits in a single chunk, an
 - **Line count**: input and output always match exactly.
 - **Determinism**: single-chunk and multi-chunk modes produce **byte-identical** output.
 - **Sort order**: verified alphabetical primary sort, numerical secondary sort.
-- **Strategies**: stream and MMF produce **byte-identical** output for the same input.
+- **Strategies**: stream, MMF and shard produce **byte-identical** output for the same input.
 - **Runtimes**: JIT and NativeAOT produce **byte-identical** output.
 - **No BOM**: output is clean UTF-8 without byte order mark.
 
@@ -364,7 +366,7 @@ The `auto` strategy (default) picks MMF when the file fits in a single chunk, an
 
 ## Algorithm
 
-The sorter uses a two-phase **external merge sort** with two interchangeable strategies (see [Sort Strategies](#sort-strategies)):
+The sorter uses a two-phase **external merge sort** with three interchangeable strategies (see [Sort Strategies](#sort-strategies)):
 
 ### Phase 1 — Split & Sort
 
@@ -463,15 +465,16 @@ Disk space is validated before sorting starts — the sorter requires at least 1
 
 ### Sort Strategies
 
-Two `IFileSorter` implementations (Strategy pattern), selectable via `--strategy`:
+Three `IFileSorter` implementations (Strategy pattern), selectable via `--strategy`:
 
 | Strategy | Flag | When to use | How it works |
 |----------|------|-------------|--------------|
-| **stream** | `--strategy stream` | High-throughput (default for large files) | PipeReader → `TextPool` string dedup → `Channel<T>` → parallel sort → binary chunks |
+| **stream** | `--strategy stream` | High-throughput (default for large files) | PipeReader → `TextPool` string dedup → `Channel<T>` → parallel sort → binary chunks → single-threaded k-way merge |
 | **mmf** | `--strategy mmf` | Zero managed allocations | `MemoryMappedFile` → `NativeBuffer<EntryIndex>` (NativeMemory) → pointer-based sort → binary chunks |
-| **auto** | `--strategy auto` (default) | Best of both | File ≤ chunk budget → MMF; larger → stream pipeline |
+| **shard** | `--strategy shard` | Many cores + many chunks (merge-bound) | Reuses stream's Phase 1, then splits chunks by first-2-bytes UTF-8 key into K shards, runs K parallel k-way merges via `Parallel.ForEachAsync`, byte-level concat in shard order |
+| **auto** | `--strategy auto` (default) | Best of all | File ≤ chunk budget → MMF; ≥ 4× chunk budget AND `--threads ≥ 4` → shard; otherwise → stream |
 
-The stream strategy excels on data with repeating text (string dedup via `TextPool` keeps unique count low) and multi-chunk workloads (concurrent pipeline). The MMF strategy excels on small files that fit in one chunk and on high-cardinality data where millions of unique strings would cause GC pressure. See [Strategy Comparison](#strategy-comparison-stream-vs-mmf) for detailed benchmarks.
+The stream strategy excels on data with repeating text (string dedup via `TextPool` keeps unique count low) and multi-chunk workloads (concurrent pipeline). The MMF strategy excels on small files that fit in one chunk and on high-cardinality data where millions of unique strings would cause GC pressure. The shard strategy is the newest — it removes the single-threaded merge bottleneck on multi-core machines, paying ~20% extra disk I/O during the split phase to get K-way parallel merge in return. The break-even point in our measurements is around 50+ chunks. See [Strategy Comparison](#strategy-comparison-when-to-use-which) for the detailed table.
 
 ### Performance Tuning
 
