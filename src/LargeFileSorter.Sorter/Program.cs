@@ -11,7 +11,10 @@ if (args.Length < 2)
     Console.WriteLine("  --temp-dir <path>     Directory for temporary files");
     Console.WriteLine("  --buffer <size>       I/O buffer size, e.g. 1MB, 4MB (default: auto)");
     Console.WriteLine("  --workers <num>       Concurrent sort workers (default: auto)");
-    Console.WriteLine("  --strategy <name>     Sort strategy: stream, mmf, auto (default: auto)");
+    Console.WriteLine("  --threads <num>       Total parallelism budget shared by all strategies");
+    Console.WriteLine("                        (workers × segments-per-chunk). Default: logical cores.");
+    Console.WriteLine("                        Use the same value across stream/mmf/shard for fair comparison.");
+    Console.WriteLine("  --strategy <name>     Sort strategy: stream, mmf, shard, auto (default: auto)");
     return 1;
 }
 
@@ -24,6 +27,9 @@ if (!File.Exists(inputPath))
     return 1;
 }
 
+// SortOptions is a readonly record struct — `with` expressions keep each option
+// setter to a single line and mean adding a new knob doesn't force us to re-list
+// every other property. Much less error-prone than the manual field-copy pattern.
 var options = new SortOptions();
 var strategy = "auto";
 for (var i = 2; i < args.Length - 1; i++)
@@ -34,54 +40,22 @@ for (var i = 2; i < args.Length - 1; i++)
             strategy = args[++i].ToLowerInvariant();
             break;
         case "--memory":
-            options = new SortOptions
-            {
-                MaxMemoryPerChunk = ParseSize(args[++i]),
-                MergeWidth = options.MergeWidth,
-                TempDirectory = options.TempDirectory,
-                BufferSize = options.BufferSize,
-                SortWorkers = options.SortWorkers
-            };
+            options = options with { MaxMemoryPerChunk = ParseSize(args[++i]) };
             break;
         case "--merge-width":
-            options = new SortOptions
-            {
-                MaxMemoryPerChunk = options.MaxMemoryPerChunk,
-                MergeWidth = int.Parse(args[++i]),
-                TempDirectory = options.TempDirectory,
-                BufferSize = options.BufferSize,
-                SortWorkers = options.SortWorkers
-            };
+            options = options with { MergeWidth = int.Parse(args[++i]) };
             break;
         case "--temp-dir":
-            options = new SortOptions
-            {
-                MaxMemoryPerChunk = options.MaxMemoryPerChunk,
-                MergeWidth = options.MergeWidth,
-                TempDirectory = args[++i],
-                BufferSize = options.BufferSize,
-                SortWorkers = options.SortWorkers
-            };
+            options = options with { TempDirectory = args[++i] };
             break;
         case "--buffer":
-            options = new SortOptions
-            {
-                MaxMemoryPerChunk = options.MaxMemoryPerChunk,
-                MergeWidth = options.MergeWidth,
-                TempDirectory = options.TempDirectory,
-                BufferSize = (int)ParseSize(args[++i]),
-                SortWorkers = options.SortWorkers
-            };
+            options = options with { BufferSize = (int)ParseSize(args[++i]) };
             break;
         case "--workers":
-            options = new SortOptions
-            {
-                MaxMemoryPerChunk = options.MaxMemoryPerChunk,
-                MergeWidth = options.MergeWidth,
-                TempDirectory = options.TempDirectory,
-                BufferSize = options.BufferSize,
-                SortWorkers = int.Parse(args[++i])
-            };
+            options = options with { SortWorkers = int.Parse(args[++i]) };
+            break;
+        case "--threads":
+            options = options with { MaxDegreeOfParallelism = int.Parse(args[++i]) };
             break;
     }
 }
@@ -96,20 +70,35 @@ Console.WriteLine($"Output: {outputPath}");
 Console.WriteLine($"Chunk memory budget: {SizeFormatter.Format(options.MaxMemoryPerChunk)}");
 Console.WriteLine($"I/O buffer: {SizeFormatter.Format(options.BufferSize)}");
 Console.WriteLine($"Sort workers: {options.SortWorkers}");
+Console.WriteLine($"Parallelism budget: {options.MaxDegreeOfParallelism}");
+Console.WriteLine($"Shard FD budget:    {ShardSorter.FileDescriptorBudget}");
 Console.WriteLine($"Merge width: {options.MergeWidth}");
 
-// Strategy selection: mmf (memory-mapped, native memory), stream (PipeReader), auto (pick best)
+// Strategy selection:
+//   mmf    — memory-mapped + native memory, best when input fits in one chunk
+//   stream — PipeReader + Channel + single-threaded k-way merge, the workhorse
+//   shard  — stream Phase 1 + partitioned parallel merge, best on multi-core for large files
+//   auto   — pick automatically based on file size and chunk budget
 IFileSorter sorter = strategy switch
 {
     "mmf" => new MmfSorter(options),
     "stream" => new ExternalSorter(options),
+    "shard" => new ShardSorter(options),
     "auto" => inputInfo.Length <= options.MaxMemoryPerChunk
-        ? new MmfSorter(options)  // file fits in one chunk → MMF is optimal
-        : new ExternalSorter(options), // multi-chunk → stream pipeline is better
-    _ => throw new ArgumentException($"Unknown strategy: {strategy}. Use: stream, mmf, auto")
+        ? new MmfSorter(options)                                    // single chunk → MMF
+        : inputInfo.Length >= options.MaxMemoryPerChunk * 4L        // many chunks + multi-core
+          && options.MaxDegreeOfParallelism >= 4
+            ? new ShardSorter(options)                              // → parallel merge
+            : new ExternalSorter(options),                          // few chunks → plain merge
+    _ => throw new ArgumentException($"Unknown strategy: {strategy}. Use: stream, mmf, shard, auto")
 };
 
-var strategyName = sorter is MmfSorter ? "mmf (memory-mapped + native memory)" : "stream (PipeReader + Channel)";
+var strategyName = sorter switch
+{
+    MmfSorter => "mmf (memory-mapped + native memory)",
+    ShardSorter => "shard (stream Phase 1 + partitioned parallel merge)",
+    _ => "stream (PipeReader + Channel)"
+};
 Console.WriteLine($"Strategy: {strategyName}");
 Console.WriteLine();
 

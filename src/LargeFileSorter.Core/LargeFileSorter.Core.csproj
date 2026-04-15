@@ -13,6 +13,10 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="LargeFileSorter.Tests" />
+    <!-- Benchmarks need direct access to ChunkMerger / BinaryChunkWriter to isolate
+         the merge phase from end-to-end runs. Keeping these types internal makes the
+         public API minimal for library consumers. -->
+    <InternalsVisibleTo Include="LargeFileSorter.Benchmarks" />
   </ItemGroup>
 
 </Project>

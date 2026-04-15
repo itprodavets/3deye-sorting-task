@@ -104,6 +104,28 @@ public sealed class ExternalSorter : IFileSorter
         }
     }
 
+    /// <summary>
+    /// Runs only Phase 1 (chunk sort) and returns the resulting sorted binary chunk files.
+    /// Exposed for <see cref="ShardSorter"/>, which reuses this pipeline unchanged and
+    /// substitutes its own parallel merge for Phase 2. Keeps the two strategies in sync
+    /// on the allocation-heavy split path without copy-pasting ~200 lines of pipeline code.
+    /// </summary>
+    internal async Task<List<string>> SortChunksOnlyAsync(
+        string inputPath, string tempDir, IProgress<string>? progress, CancellationToken ct)
+    {
+        EnsureMinThreads();
+        var previousLatency = GCSettings.LatencyMode;
+        try
+        {
+            GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
+            return await SplitAndSortAsync(inputPath, tempDir, progress, ct);
+        }
+        finally
+        {
+            GCSettings.LatencyMode = previousLatency;
+        }
+    }
+
     // -------------------------------------------------------------------
     //  Phase 1 — PipeReader → parse UTF-8 → Channel → parallel sort → binary write
     // -------------------------------------------------------------------
@@ -111,8 +133,11 @@ public sealed class ExternalSorter : IFileSorter
     private async Task<List<string>> SplitAndSortAsync(
         string inputPath, string tempDir, IProgress<string>? progress, CancellationToken ct)
     {
-        var workerCount = _options.SortWorkers;
-        var sortParallelism = Math.Max(2, Environment.ProcessorCount / workerCount);
+        // Cap workers by the total parallelism budget so "--threads 2" never spawns 4 workers.
+        var workerCount = Math.Max(1, Math.Min(_options.SortWorkers, _options.MaxDegreeOfParallelism));
+        // Segments per chunk = leftover CPU budget after workers. Minimum 2 so large chunks
+        // still benefit from parallel sort even when the budget is tight.
+        var sortParallelism = Math.Max(2, _options.MaxDegreeOfParallelism / workerCount);
 
         var channel = Channel.CreateBounded<ChunkPayload>(
             new BoundedChannelOptions(workerCount)

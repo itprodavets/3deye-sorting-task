@@ -47,10 +47,18 @@ public readonly record struct SortOptions
     /// <summary>
     /// Number of concurrent sort workers that process chunks in parallel.
     /// Each worker runs its own parallel intra-chunk sort + binary write.
-    /// Default: auto-scales to half of available logical cores, clamped 1–4.
+    /// Default: memory-bounded (roughly ½ RAM / chunk budget), never exceeding ½ cores.
     /// Set lower to leave CPU headroom for other processes.
     /// </summary>
     public int SortWorkers { get; init; } = GetDefaultSortWorkers();
+
+    /// <summary>
+    /// Total CPU parallelism budget shared across all sort work (workers × segments-per-chunk).
+    /// Default: <see cref="Environment.ProcessorCount"/>. Expose via the CLI flag
+    /// <c>--threads N</c> so every strategy (stream / mmf / shard) can be benchmarked under
+    /// identical concurrency — no strategy is artificially throttled in comparisons.
+    /// </summary>
+    public int MaxDegreeOfParallelism { get; init; } = Environment.ProcessorCount;
 
     /// <summary>
     /// Reports the auto-detected hardware profile for diagnostics.
@@ -93,7 +101,16 @@ public readonly record struct SortOptions
     }
 
     private static int GetDefaultSortWorkers()
-        => Math.Clamp(Environment.ProcessorCount / 2, 1, 4);
+    {
+        // Each worker holds roughly one chunk in memory (see MaxMemoryPerChunk —
+        // 1 GB on small machines, up to 8 GB on 64 GB+). Use half of total RAM as
+        // the worker budget so the OS, I/O buffers and TextPool have headroom;
+        // the other half is the hard cap that protects small machines from OOM.
+        var perWorker = Math.Max(1L, GetDefaultChunkMemory());
+        var maxByMemory = (int)Math.Max(1, (GetTotalMemory() / 2) / perWorker);
+        var halfCores = Math.Max(1, Environment.ProcessorCount / 2);
+        return Math.Min(halfCores, maxByMemory);
+    }
 
     private static long GetTotalMemory()
     {
@@ -120,6 +137,7 @@ public readonly record struct HardwareProfile
     public long DefaultChunkMemory { get; }
     public int DefaultBufferSize { get; }
     public int SortWorkers { get; }
+    public int MaxDegreeOfParallelism { get; }
 
     // Parameterless struct constructor must be public (C# rules for record struct).
     // Behaviourally equivalent to SortOptions.DetectHardware() — both paths produce
@@ -141,6 +159,7 @@ public readonly record struct HardwareProfile
         DefaultChunkMemory = opts.MaxMemoryPerChunk;
         DefaultBufferSize = opts.BufferSize;
         SortWorkers = opts.SortWorkers;
+        MaxDegreeOfParallelism = opts.MaxDegreeOfParallelism;
     }
 
     public override string ToString()
@@ -149,6 +168,7 @@ public readonly record struct HardwareProfile
                $"Cores: {LogicalCores}, " +
                $"Chunk budget: {SizeFormatter.Format(DefaultChunkMemory)}, " +
                $"I/O buffer: {SizeFormatter.Format(DefaultBufferSize)}, " +
-               $"Sort workers: {SortWorkers}";
+               $"Sort workers: {SortWorkers}, " +
+               $"Parallelism: {MaxDegreeOfParallelism}";
     }
 }

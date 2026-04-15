@@ -35,9 +35,13 @@ internal static class ChunkSorter
             return;
         }
 
+        // Caller-supplied budget drives segment count directly — artificial caps
+        // (old: clamp to 8) would throttle benchmarks run with --threads > 8 and
+        // make cross-strategy comparisons apples-to-oranges. Floor at 2 so large
+        // chunks still use parallel sort even on minimally-sized budgets.
         var segCount = maxParallelism > 0
-            ? Math.Clamp(maxParallelism, 2, 8)
-            : Math.Clamp(Environment.ProcessorCount, 2, 8);
+            ? Math.Max(2, maxParallelism)
+            : Math.Max(2, Environment.ProcessorCount);
         var segSize = count / segCount;
 
         Parallel.For(0, segCount, new ParallelOptions { MaxDegreeOfParallelism = segCount }, i =>
@@ -74,9 +78,13 @@ internal static class ChunkSorter
             return;
         }
 
+        // Caller-supplied budget drives segment count directly — artificial caps
+        // (old: clamp to 8) would throttle benchmarks run with --threads > 8 and
+        // make cross-strategy comparisons apples-to-oranges. Floor at 2 so large
+        // chunks still use parallel sort even on minimally-sized budgets.
         var segCount = maxParallelism > 0
-            ? Math.Clamp(maxParallelism, 2, 8)
-            : Math.Clamp(Environment.ProcessorCount, 2, 8);
+            ? Math.Max(2, maxParallelism)
+            : Math.Max(2, Environment.ProcessorCount);
         var segSize = count / segCount;
 
         Parallel.For(0, segCount, new ParallelOptions { MaxDegreeOfParallelism = segCount }, i =>
