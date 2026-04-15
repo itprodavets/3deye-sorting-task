@@ -65,12 +65,29 @@ public sealed class FileGenerator : IFileGenerator
 
     private string[] BuildPhrasePool(Random random)
     {
-        var phrases = new string[_options.UniquePhraseCount];
+        // Uniqueness matters: GeneratorOptions.UniquePhraseCount and the --phrases CLI flag
+        // are both documented as "number of unique phrases", and benchmarks rely on cardinality
+        // to estimate TextPool dedup effectiveness. The previous implementation just filled a
+        // fixed-size array, so random collisions (e.g. "Apple", "Apple is the best" generated
+        // twice from different rolls) silently left the pool with fewer distinct values than
+        // requested — a 500-phrase pool frequently ended up with ~420 distinct strings.
+        //
+        // We keep an ordered List so the array returned is stable across runs with the same
+        // seed (HashSet.ToArray() would be non-deterministic in .NET because of randomized
+        // string hash codes), plus a HashSet for O(1) membership checks.
+        var seen = new HashSet<string>(capacity: _options.UniquePhraseCount);
+        var phrases = new List<string>(_options.UniquePhraseCount);
+        var sb = new StringBuilder();
 
-        for (var i = 0; i < phrases.Length; i++)
+        // The word pool's combinatorial space (Σ |W|^k for k ∈ {1..4}) is ~3.5M; 100×
+        // the requested count is plenty for realistic inputs and still guards against
+        // pathological calls (UniquePhraseCount set above the combinatorial ceiling).
+        var attemptBudget = Math.Max(1000, _options.UniquePhraseCount * 100);
+
+        for (var attempts = 0; phrases.Count < _options.UniquePhraseCount && attempts < attemptBudget; attempts++)
         {
             var wordCount = random.Next(1, 5);
-            var sb = new StringBuilder();
+            sb.Clear();
 
             for (var w = 0; w < wordCount; w++)
             {
@@ -81,10 +98,20 @@ public sealed class FileGenerator : IFileGenerator
             if (sb.Length > 0 && char.IsLower(sb[0]))
                 sb[0] = char.ToUpperInvariant(sb[0]);
 
-            phrases[i] = sb.ToString();
+            var phrase = sb.ToString();
+            if (seen.Add(phrase))
+                phrases.Add(phrase);
         }
 
-        return phrases;
+        if (phrases.Count < _options.UniquePhraseCount)
+        {
+            throw new InvalidOperationException(
+                $"Could not generate {_options.UniquePhraseCount} distinct phrases from the word pool " +
+                $"(got {phrases.Count} after {attemptBudget} attempts). Either lower --phrases or enlarge " +
+                $"the word pool in FileGenerator.WordPool.");
+        }
+
+        return phrases.ToArray();
     }
 
     private static int DigitCount(long n)

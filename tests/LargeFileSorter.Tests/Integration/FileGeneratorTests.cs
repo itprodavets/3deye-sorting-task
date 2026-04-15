@@ -90,4 +90,34 @@ public class FileGeneratorTests : IDisposable
         var content2 = await File.ReadAllTextAsync(path2);
         content1.Should().Be(content2);
     }
+
+    /// <summary>
+    /// Regression for the reviewer's finding: before dedup, a 2 MB file with
+    /// <c>--phrases 500 --seed 1</c> contained only ~424 distinct phrase values. The pool
+    /// was built by filling a fixed-size array with independent random draws, so random
+    /// collisions silently shrank the effective cardinality.
+    ///
+    /// A 2 MB file at ~50 bytes/line yields ~40 K draws from the pool, which — with a pool
+    /// of 500 — draws every phrase with overwhelming probability (miss rate ≈ (499/500)^40000
+    /// ≈ 10⁻³⁵). So distinct-in-output equals distinct-in-pool, and we can assert exact
+    /// equality with <see cref="GeneratorOptions.UniquePhraseCount"/>.
+    /// </summary>
+    [Fact]
+    public async Task GenerateAsync_HonorsUniquePhraseCount_ExactlyNoDuplicates()
+    {
+        var outputPath = Path.Combine(_tempDir, "phrases.txt");
+        var generator = new FileGenerator(new GeneratorOptions
+        {
+            Seed = 1,
+            UniquePhraseCount = 500
+        });
+
+        await generator.GenerateAsync(outputPath, 2 * 1024 * 1024);
+
+        var lines = await File.ReadAllLinesAsync(outputPath);
+        var distinctPhrases = lines.Select(l => LineParser.Parse(l).Text).Distinct().Count();
+
+        distinctPhrases.Should().Be(500,
+            "UniquePhraseCount is documented as 'number of unique phrases' — the pool must contain exactly that many distinct values");
+    }
 }

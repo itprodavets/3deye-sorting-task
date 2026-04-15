@@ -143,7 +143,8 @@ public sealed class MmfSorter : IFileSorter
         var chunkPaths = new List<string>();
         // MMF keeps one chunk in memory at a time (the mapped view), so the whole
         // parallelism budget goes to intra-chunk segmentation — no outer worker fan-out.
-        var parallelism = Math.Max(2, _options.MaxDegreeOfParallelism);
+        // Floor at 1 (not 2): --threads 1 must actually stay single-threaded.
+        var parallelism = Math.Max(1, _options.MaxDegreeOfParallelism);
         long pos = 0;
         var chunkIndex = 0;
 
@@ -284,14 +285,16 @@ public sealed class MmfSorter : IFileSorter
         NativeBuffer<EntryIndex> entries, byte* filePtr, int parallelism)
     {
         var count = entries.Count;
-        if (count < 50_000)
+        // Honor budget=1 literally: parallel path opens segments+merge overhead that
+        // single-threaded sort doesn't need. Matches ChunkSorter's gate.
+        if (count < 50_000 || parallelism <= 1)
         {
             entries.AsSpan().Sort((a, b) => CompareEntries(a, b, filePtr));
             return;
         }
 
         // No artificial cap — caller's budget is authoritative. See comment in ChunkSorter.
-        var segCount = Math.Max(2, parallelism);
+        var segCount = parallelism;
         var segSize = count / segCount;
 
         Parallel.For(0, segCount, new ParallelOptions { MaxDegreeOfParallelism = segCount }, i =>

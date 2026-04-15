@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using LargeFileSorter.Core;
 
 if (args.Length < 2)
@@ -43,7 +44,7 @@ for (var i = 2; i < args.Length - 1; i++)
             options = options with { MaxMemoryPerChunk = ParseSize(args[++i]) };
             break;
         case "--merge-width":
-            options = options with { MergeWidth = int.Parse(args[++i]) };
+            options = options with { MergeWidth = int.Parse(args[++i], CultureInfo.InvariantCulture) };
             break;
         case "--temp-dir":
             options = options with { TempDirectory = args[++i] };
@@ -52,10 +53,10 @@ for (var i = 2; i < args.Length - 1; i++)
             options = options with { BufferSize = (int)ParseSize(args[++i]) };
             break;
         case "--workers":
-            options = options with { SortWorkers = int.Parse(args[++i]) };
+            options = options with { SortWorkers = int.Parse(args[++i], CultureInfo.InvariantCulture) };
             break;
         case "--threads":
-            options = options with { MaxDegreeOfParallelism = int.Parse(args[++i]) };
+            options = options with { MaxDegreeOfParallelism = int.Parse(args[++i], CultureInfo.InvariantCulture) };
             break;
     }
 }
@@ -137,13 +138,23 @@ static long ParseSize(string input)
 {
     input = input.Trim().ToUpperInvariant();
 
-    if (input.EndsWith("GB"))
-        return (long)(double.Parse(input[..^2]) * 1024 * 1024 * 1024);
-    if (input.EndsWith("MB"))
-        return (long)(double.Parse(input[..^2]) * 1024 * 1024);
-    if (input.EndsWith("KB"))
-        return (long)(double.Parse(input[..^2]) * 1024);
+    // Parse the numeric prefix with InvariantCulture + strict NumberStyles:
+    //   * InvariantCulture so "1.5GB" works regardless of the user's system locale.
+    //     Without it, machines where the decimal separator is ',' (ru-RU, de-DE, fr-FR, etc.)
+    //     rejected "1.5GB" with FormatException and silently accepted "1,5GB".
+    //   * No AllowThousands — default double.Parse allows ',' as a thousand separator, which
+    //     would silently turn ru-RU-looking "1,5KB" into 15 KB instead of failing loudly.
+    // Decimal point only; anything else (commas, exponent notation, currency symbols) is rejected.
+    const NumberStyles DoubleStyle = NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint;
+    const NumberStyles IntStyle = NumberStyles.AllowLeadingSign;
 
-    return long.Parse(input);
+    if (input.EndsWith("GB"))
+        return (long)(double.Parse(input[..^2], DoubleStyle, CultureInfo.InvariantCulture) * 1024 * 1024 * 1024);
+    if (input.EndsWith("MB"))
+        return (long)(double.Parse(input[..^2], DoubleStyle, CultureInfo.InvariantCulture) * 1024 * 1024);
+    if (input.EndsWith("KB"))
+        return (long)(double.Parse(input[..^2], DoubleStyle, CultureInfo.InvariantCulture) * 1024);
+
+    return long.Parse(input, IntStyle, CultureInfo.InvariantCulture);
 }
 

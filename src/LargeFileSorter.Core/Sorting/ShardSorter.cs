@@ -92,6 +92,22 @@ public sealed partial class ShardSorter : IFileSorter
                 GC.Collect(2, GCCollectionMode.Optimized, blocking: false);
 
                 var shardCount = PickShardCount(chunkFiles.Count);
+                if (shardCount <= 1)
+                {
+                    // Budget=1 (or FD budget collapsed to 1) → sharding is pure overhead over
+                    // the stream k-way merge. Short-circuit to it rather than doing a 1-way
+                    // split + 1-way merge + copy. Matches --strategy stream exactly at budget=1.
+                    progress?.Report($"Phase 2: single-shard fallback — merging {chunkFiles.Count} sorted chunks...");
+                    var fallbackMerger = new ChunkMerger(
+                        _options.BufferSize,
+                        _options.MergeWidth,
+                        path => new BinaryChunkReader(path, _options.BufferSize),
+                        path => new BinaryRawChunkReader(path, _options.BufferSize));
+                    fallbackMerger.MergeAll(chunkFiles, outputPath, tempDir, progress, ct);
+                    progress?.Report("Done.");
+                    return;
+                }
+
                 var boundaries = ComputeShardBoundaries(shardCount);
 
                 progress?.Report($"Phase 2a: splitting {chunkFiles.Count} chunks into {shardCount} shards...");
@@ -144,6 +160,18 @@ public sealed partial class ShardSorter : IFileSorter
         }
 
         var shardCount = PickShardCount(chunkFiles.Count);
+        if (shardCount <= 1)
+        {
+            // Same fallback as SortAsync — sharding is pure overhead at budget=1.
+            var fallbackMerger = new ChunkMerger(
+                _options.BufferSize,
+                _options.MergeWidth,
+                path => new BinaryChunkReader(path, _options.BufferSize),
+                path => new BinaryRawChunkReader(path, _options.BufferSize));
+            fallbackMerger.MergeAll(chunkFiles, outputPath, tempDir, progress, ct);
+            return;
+        }
+
         var boundaries = ComputeShardBoundaries(shardCount);
 
         progress?.Report($"Phase 2a: splitting {chunkFiles.Count} chunks into {shardCount} shards...");
@@ -167,14 +195,19 @@ public sealed partial class ShardSorter : IFileSorter
     /// merges, so it never opens more than <see cref="SortOptions.MergeWidth"/> readers at once.
     /// The earlier "(chunkCount + 2)" formula was 30× too pessimistic at 86 chunks: it picked
     /// 2 shards even at --threads 16, kneecapping the whole point of the strategy.
+    ///
+    /// May return 1 — the <see cref="SortAsync"/> caller falls back to <see cref="ChunkMerger.MergeAll"/>
+    /// in that case, which is strictly cheaper than a 1-way split+concat. Previously this method
+    /// floored at 2 so even <c>--threads 1</c> spawned 2 shards; the floor violated the
+    /// documented "total parallelism budget" contract for the <c>--threads</c> flag.
     /// </summary>
     private int PickShardCount(int chunkCount)
     {
-        var requested = Math.Max(2, _options.MaxDegreeOfParallelism);
+        var requested = Math.Max(1, _options.MaxDegreeOfParallelism);
         // Per-shard peak FDs: min(actual sub-chunks, mergeWidth) for readers + 1 writer.
         // Capped at chunkCount because shards with fewer sub-chunks than mergeWidth open fewer.
         var perShardFds = Math.Min(chunkCount, _options.MergeWidth) + 1;
-        var fdCapped = Math.Max(2, FileDescriptorBudget / perShardFds);
+        var fdCapped = Math.Max(1, FileDescriptorBudget / perShardFds);
         return Math.Min(requested, fdCapped);
     }
 

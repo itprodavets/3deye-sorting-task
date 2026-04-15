@@ -128,11 +128,18 @@ public class BinaryRawChunkReaderTests : IDisposable
 
 public class RawLineEntryTests
 {
+    /// <summary>
+    /// RawLineEntry orders by UTF-8 lexicographic byte order, which is equivalent to
+    /// Unicode code-point order. For code points below U+D800 this also happens to match
+    /// <see cref="StringComparison.Ordinal"/> (UTF-16 code-unit order) — the previous
+    /// version of this test asserted general equivalence with Ordinal and reinforced the
+    /// wrong mental model. The supplementary-plane case in
+    /// <see cref="OrderingMatchesCodePointOrder_NotUtf16CodeUnitOrder"/> pins down the
+    /// distinction so nobody "fixes" RawLineEntry to match Ordinal again.
+    /// </summary>
     [Fact]
-    public void OrderingMatchesLineEntry_OrdinalOnFirstBytes()
+    public void OrderingMatchesUtf8ByteOrder()
     {
-        // UTF-8 lexicographic ordering must match StringComparison.Ordinal
-        // so that merge output stays identical to the string-based path.
         var pairs = new[]
         {
             ("Apple", "Banana"),
@@ -146,11 +153,36 @@ public class RawLineEntryTests
         {
             var rawA = MakeRaw(1, a);
             var rawB = MakeRaw(1, b);
-            var strCmp = string.Compare(a, b, StringComparison.Ordinal);
+            var byteCmp = Encoding.UTF8.GetBytes(a).AsSpan()
+                .SequenceCompareTo(Encoding.UTF8.GetBytes(b));
 
-            Math.Sign(rawA.CompareTo(rawB)).Should().Be(Math.Sign(strCmp),
-                $"comparison of '{a}' vs '{b}' must match ordinal string comparison");
+            Math.Sign(rawA.CompareTo(rawB)).Should().Be(Math.Sign(byteCmp),
+                $"comparison of '{a}' vs '{b}' must match UTF-8 byte order");
         }
+    }
+
+    /// <summary>
+    /// Supplementary-plane code points (<c>U+10000+</c>) vs BMP code points in
+    /// <c>[U+E000, U+FFFF]</c> are the witness case where UTF-16 Ordinal and UTF-8 byte
+    /// order DISAGREE. <see cref="RawLineEntry"/> must follow the UTF-8 order so that
+    /// stream / mmf / shard all produce byte-identical output.
+    /// </summary>
+    [Fact]
+    public void OrderingMatchesCodePointOrder_NotUtf16CodeUnitOrder()
+    {
+        // U+10000 "𐀀" (surrogate pair 0xD800 0xDC00 in UTF-16, F0 90 80 80 in UTF-8)
+        // U+FF80 "ﾀ"  (single code unit 0xFF80 in UTF-16, EF BE 80 in UTF-8)
+        var supplementary = MakeRaw(1, "𐀀");
+        var bmpHigh       = MakeRaw(1, "ﾀ");
+
+        // UTF-8 / code-point order: ﾀ (0xEF..) < 𐀀 (0xF0..)
+        bmpHigh.CompareTo(supplementary).Should().BeLessThan(0,
+            "UTF-8 byte order puts ﾀ (0xEF…) before 𐀀 (0xF0…)");
+
+        // But UTF-16 Ordinal would say the opposite — guard so nobody switches back.
+        string.Compare("ﾀ", "𐀀", StringComparison.Ordinal).Should().BeGreaterThan(0,
+            "UTF-16 Ordinal puts 𐀀 (surrogate 0xD800) before ﾀ (0xFF80) — " +
+            "that's exactly the ordering we must NOT reintroduce into RawLineEntry");
     }
 
     [Fact]

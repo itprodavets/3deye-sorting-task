@@ -29,19 +29,17 @@ internal static class ChunkSorter
     /// </summary>
     public static void Sort(LineEntry[] data, int count, int maxParallelism = -1)
     {
-        if (count < ParallelThreshold)
+        // Honor the parallelism budget strictly: budget=1 must stay single-threaded.
+        // Previously this floor was Math.Max(2, ...) so even --threads 1 spawned 2 segments,
+        // which silently broke benchmarks comparing single-core vs multi-core behavior.
+        var parallelism = maxParallelism > 0 ? maxParallelism : Environment.ProcessorCount;
+        if (count < ParallelThreshold || parallelism <= 1)
         {
             data.AsSpan(0, count).Sort();
             return;
         }
 
-        // Caller-supplied budget drives segment count directly — artificial caps
-        // (old: clamp to 8) would throttle benchmarks run with --threads > 8 and
-        // make cross-strategy comparisons apples-to-oranges. Floor at 2 so large
-        // chunks still use parallel sort even on minimally-sized budgets.
-        var segCount = maxParallelism > 0
-            ? Math.Max(2, maxParallelism)
-            : Math.Max(2, Environment.ProcessorCount);
+        var segCount = parallelism;
         var segSize = count / segCount;
 
         Parallel.For(0, segCount, new ParallelOptions { MaxDegreeOfParallelism = segCount }, i =>
@@ -71,20 +69,16 @@ internal static class ChunkSorter
     public static void SortAndWrite(LineEntry[] data, int count, int maxParallelism,
         string outputPath, int bufferSize)
     {
-        if (count < ParallelThreshold)
+        // Honor the parallelism budget strictly — see Sort() for rationale.
+        var parallelism = maxParallelism > 0 ? maxParallelism : Environment.ProcessorCount;
+        if (count < ParallelThreshold || parallelism <= 1)
         {
             data.AsSpan(0, count).Sort();
             WriteSequential(data, count, outputPath, bufferSize);
             return;
         }
 
-        // Caller-supplied budget drives segment count directly — artificial caps
-        // (old: clamp to 8) would throttle benchmarks run with --threads > 8 and
-        // make cross-strategy comparisons apples-to-oranges. Floor at 2 so large
-        // chunks still use parallel sort even on minimally-sized budgets.
-        var segCount = maxParallelism > 0
-            ? Math.Max(2, maxParallelism)
-            : Math.Max(2, Environment.ProcessorCount);
+        var segCount = parallelism;
         var segSize = count / segCount;
 
         Parallel.For(0, segCount, new ParallelOptions { MaxDegreeOfParallelism = segCount }, i =>

@@ -135,9 +135,10 @@ public sealed class ExternalSorter : IFileSorter
     {
         // Cap workers by the total parallelism budget so "--threads 2" never spawns 4 workers.
         var workerCount = Math.Max(1, Math.Min(_options.SortWorkers, _options.MaxDegreeOfParallelism));
-        // Segments per chunk = leftover CPU budget after workers. Minimum 2 so large chunks
-        // still benefit from parallel sort even when the budget is tight.
-        var sortParallelism = Math.Max(2, _options.MaxDegreeOfParallelism / workerCount);
+        // Segments per chunk = leftover CPU budget after workers. Floor at 1 so --threads 1
+        // actually stays single-threaded (previously Math.Max(2, …) silently forced two segments
+        // even on a single-thread budget, breaking the --threads contract).
+        var sortParallelism = Math.Max(1, _options.MaxDegreeOfParallelism / workerCount);
 
         var channel = Channel.CreateBounded<ChunkPayload>(
             new BoundedChannelOptions(workerCount)

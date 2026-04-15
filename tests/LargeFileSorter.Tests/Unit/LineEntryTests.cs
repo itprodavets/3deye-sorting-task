@@ -63,4 +63,25 @@ public class LineEntryTests
             new LineEntry(30432, "Something something something")
         );
     }
+
+    /// <summary>
+    /// Pins the UTF-8 byte-order contract at the lowest level. Supplementary-plane code
+    /// points (<c>U+10000+</c>) must sort AFTER BMP code points in <c>[U+E000, U+FFFF]</c>
+    /// so that <see cref="LineEntry"/> matches <see cref="RawLineEntry"/> byte-for-byte.
+    /// Guards against regressing back to <see cref="StringComparison.Ordinal"/>, which
+    /// would invert this pair because the high surrogate 0xD800 &lt; 0xFF80 in UTF-16.
+    /// </summary>
+    [Fact]
+    public void CompareTo_UsesUtf8ByteOrder_NotUtf16CodeUnitOrder()
+    {
+        var supplementary = new LineEntry(1, "𐀀"); // U+10000, UTF-8 F0 90 80 80
+        var bmpHigh       = new LineEntry(1, "ﾀ");  // U+FF80,  UTF-8 EF BE 80
+
+        bmpHigh.CompareTo(supplementary).Should().BeNegative(
+            "UTF-8 byte order (the cross-strategy contract) puts ﾀ before 𐀀");
+
+        // Witness: the old Ordinal-based comparison would say the opposite.
+        string.Compare("ﾀ", "𐀀", StringComparison.Ordinal).Should().BeGreaterThan(0,
+            "guard against silently reverting to StringComparison.Ordinal");
+    }
 }

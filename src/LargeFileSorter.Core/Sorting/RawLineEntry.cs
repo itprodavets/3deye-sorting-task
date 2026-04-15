@@ -10,8 +10,14 @@ namespace LargeFileSorter.Core;
 /// At 100 GB scale this eliminates ~4.5 billion string allocations during Phase 2 —
 /// the only remaining string allocation hotspot after TextPool deduplication.
 ///
-/// Ordering is preserved: UTF-8 byte ordering matches UTF-16 <see cref="StringComparison.Ordinal"/>
-/// ordering because UTF-8 was designed so that lexicographic byte order equals codepoint order.
+/// <b>Ordering is UTF-8 lexicographic byte order, equivalent to Unicode code-point order.</b>
+/// <see cref="LineEntry.CompareTo"/> iterates <see cref="System.Text.Rune"/>s for the same
+/// order on <see cref="string"/> data, so Phase 1 (stream strategy) and Phase 2 (this struct)
+/// agree on sort order regardless of input character plane. Note this is *not* the same as
+/// <see cref="StringComparison.Ordinal"/> — that one is UTF-16 <i>code-unit</i> order and
+/// puts surrogate pairs (supplementary plane, <c>U+10000+</c>) before BMP code points in
+/// <c>[U+E000, U+FFFF]</c>, while UTF-8 byte order does the opposite. The cross-strategy
+/// parity tests encode that distinction explicitly.
 /// </summary>
 public readonly struct RawLineEntry : IComparable<RawLineEntry>
 {
