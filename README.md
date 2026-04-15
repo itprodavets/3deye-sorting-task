@@ -328,25 +328,55 @@ The tables below are **regenerated automatically** by [`.github/workflows/benchm
 
 > **Note on absolute numbers.** GitHub's shared runners are 2-core VMs with ~7 GB RAM and are typically **2–3× slower** than modern consumer hardware. Use the table to compare **rows** (e.g. `stream` vs `mmf` on the same size) — not absolute throughput against your workstation. For a locally-measured run on beefy hardware, invoke `scripts/bench.sh` directly.
 
-### Large-File Reference Run (100 GB)
+### Local Reference Runs (Apple M4 Max)
 
-The CI matrix tops out at 1 GB because GitHub's shared runners have only 14 GB of disk. Below is a one-shot reference run on a single 100 GB file, measured on my own workstation:
+The CI matrix above uses 2-core shared runners. Below is the **same `scripts/bench.sh`** run on my workstation so you can calibrate CI numbers against real hardware. All three strategies, min of 2 timed runs after 1 warmup, generated 2026-04-15.
 
-| Size | Strategy | Lines | Time | Throughput | Peak RSS | Chunks |
-|------|----------|------:|-----:|-----------:|---------:|-------:|
-| 100 GB | stream | 4 456 315 686 | **11:04.24** | 154 MB/s | 20 GB | 17 |
+Hardware: **Apple M4 Max (16 cores), 64 GB RAM, APFS SSD, .NET 10.0.102, macOS 26.3.1**.
 
-Hardware: Apple M4 Max (16 cores), 64 GB RAM, APFS SSD, .NET 10.0.102, macOS.
+| Size | Strategy | Lines | Chunks | Threads | Time | Throughput | Peak RSS | Result |
+|------|----------|------:|-------:|--------:|-----:|-----------:|---------:|:------:|
+| 10 MB  | stream | 388 983       | 1 | 16 | 0.21 s   | 48 MB/s  | 157 MB   | ok |
+| 10 MB  | mmf    | 388 983       | 1 | 16 | 0.21 s   | 48 MB/s  | 148 MB   | ok |
+| 10 MB  | shard  | 388 983       | 1 | 16 | 0.20 s   | 49 MB/s  | 157 MB   | ok |
+| 50 MB  | stream | 1 945 702     | 1 | 16 | 0.87 s   | 58 MB/s  | 329 MB   | ok |
+| 50 MB  | mmf    | 1 945 702     | 1 | 16 | 0.73 s   | 69 MB/s  | 432 MB   | ok |
+| 50 MB  | shard  | 1 945 702     | 1 | 16 | 0.86 s   | 58 MB/s  | 329 MB   | ok |
+| 200 MB | stream | 7 782 241     | 1 | 16 | 2.15 s   | 93 MB/s  | 662 MB   | ok |
+| 200 MB | mmf    | 7 782 241     | 1 | 16 | 2.41 s   | 83 MB/s  | 1.14 GB  | ok |
+| 200 MB | shard  | 7 782 241     | 1 | 16 | 2.15 s   | 93 MB/s  | 662 MB   | ok |
+| 1 GB   | stream | 39 850 773    | 1 | 16 | 8.87 s   | 115 MB/s | 3.28 GB  | ok |
+| 1 GB   | mmf    | 39 850 773    | 1 | 16 | 10.10 s  | 101 MB/s | 5.61 GB  | ok |
+| 1 GB   | shard  | 39 850 773    | 1 | 16 | 8.53 s   | 120 MB/s | 3.28 GB  | ok |
+| 5 GB   | stream | 199 249 762   | 1 | 16 | 41.70 s  | 123 MB/s | 12.29 GB | ok |
+| 5 GB   | mmf    | 199 249 762   | 1 | 16 | 50.11 s  | 102 MB/s | 20.89 GB | ok |
+| 5 GB   | shard  | 199 249 762   | 1 | 16 | 42.29 s  | 121 MB/s | 12.29 GB | ok |
+| 10 GB  | stream | 398 498 387   | 2 | 16 | 69.13 s  | 148 MB/s | 12.20 GB | ok |
+| 10 GB  | mmf    | 398 498 387   | 2 | 16 | 106.55 s | 96 MB/s  | 22.85 GB | ok |
+| 10 GB  | shard  | 398 498 387   | 1 | 16 | 86.64 s  | 118 MB/s | 12.38 GB | ok |
+| 100 GB | stream | 4 456 315 686 | 17 | 16 | **11:04.24** | 154 MB/s | 20 GB | ok |
 
-Run command:
+Reading the table:
+
+- **CI-vs-local gap matches the 2–3× note above** — e.g. 1 GB stream is 24.45 s on CI vs 8.87 s here (≈ 2.8×), 1 GB mmf 29.27 s vs 10.10 s (≈ 2.9×). Within a row, **relative strategy order agrees with CI**, so the cheaper CI table is a faithful proxy.
+- **Stream edges past MMF once I/O overlaps sort work** (≥ 200 MB). MMF has to page the whole file into virtual memory before Phase 1 starts — that's why its peak RSS runs ~2× higher (20.89 GB at 5 GB input vs 12.29 GB for stream), and why its throughput plateaus near 100 MB/s while stream/shard climb to 120–150 MB/s. Below ~100 MB, MMF's zero-alloc path still wins by a hair.
+- **Shard barely beats stream here** — single-chunk at 1 GB / 5 GB it matches stream within ±2 %; at 10 GB stream's multi-chunk k-way merge actually wins by ~20 s. Shard's partitioned-merge advantage only shows up when *Phase 2 merge dominates*, i.e. many Phase 1 chunks (e.g. `--memory 256M` on a large input). The `--threads 16` benefit in the "Strategy Comparison" table below was measured under that forced-multi-chunk scenario, not the default 8 GB chunk budget that this matrix uses.
+- **Throughput grows with file size** on this hardware: 48 MB/s at 10 MB → 148 MB/s at 10 GB. Startup costs (JIT tiering, thread-pool warm-up, first I/O submissions) amortize over more data.
+- **`Chunks` column caveat**: `bench.sh` detects chunk count by grepping `"Phase 2: merging N sorted chunks"`, which only stream and MMF emit. Shard uses a split-concat path and writes different progress lines, so its `Chunks` column always reads `1` — ignore that cell for shard rows (at 10 GB shard is demonstrably multi-chunk: the 8 GB budget forces Phase 1 to split).
+
+Reproduce with:
 
 ```bash
+# 10 MB → 10 GB matrix (matches the table above, all three strategies):
+BENCH_SIZES='10MB 50MB 200MB 1GB 5GB 10GB' scripts/bench.sh
+
+# 100 GB hero run (stream only, needs ~200 GB free on the target volume):
 dotnet run --project src/LargeFileSorter.Generator -c Release -- data/input_100gb.txt 100GB --seed 42
 /usr/bin/time -l dotnet run --project src/LargeFileSorter.Sorter -c Release -- \
     data/input_100gb.txt data/sorted_100gb.txt --strategy stream
 ```
 
-Verified after the run: input and output line counts match exactly (4 456 315 686 lines each), first three output lines are `1. Always`, last three are `100000. Yesterday yesterday Honeydew Apple`. To reproduce, use `BENCH_SIZES='100GB' scripts/bench.sh` on a machine with at least ~200 GB of free space.
+Verified after the 100 GB run: input and output line counts match exactly (4 456 315 686 lines each), first three output lines are `1. Always`, last three are `100000. Yesterday yesterday Honeydew Apple`.
 
 ### Strategy Comparison: When to Use Which
 
