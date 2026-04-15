@@ -47,17 +47,6 @@ benchmarks/
 dotnet build
 ```
 
-## Quick Start
-
-The easiest way to try everything — interactive menu with guided prompts:
-
-```bash
-chmod +x run.sh
-./run.sh
-```
-
-The menu offers: generate a test file, sort a file, full pipeline (generate + sort), run tests, benchmarks, build, publish native binaries (NativeAOT), and clean.
-
 ## Usage
 
 ### 1. Generate a test file
@@ -206,10 +195,9 @@ Output size: 1.0 GB
 
 ### 3. Full pipeline (generate + sort)
 
-The interactive menu (`./run.sh`, option 3) runs both steps in sequence and verifies the line count matches.
+Run both steps in sequence:
 
 ```bash
-# Or manually:
 dotnet run --project src/LargeFileSorter.Generator -c Release -- data/input.txt 1GB --seed 42
 dotnet run --project src/LargeFileSorter.Sorter -c Release -- data/input.txt data/sorted.txt
 ```
@@ -243,10 +231,6 @@ dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release -- --filte
 Ahead-of-time compilation produces a self-contained native binary — no .NET runtime required, near-instant startup, minimal binary footprint.
 
 ```bash
-# Auto-detect platform (macOS/Linux/Windows, arm64/x64)
-./run.sh  # option 7
-
-# Or manually:
 dotnet publish src/LargeFileSorter.Sorter -c Release -r osx-arm64 /p:PublishAot=true -o publish/
 dotnet publish src/LargeFileSorter.Generator -c Release -r osx-arm64 /p:PublishAot=true -o publish/
 ```
