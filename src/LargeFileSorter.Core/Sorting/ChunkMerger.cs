@@ -109,8 +109,14 @@ internal sealed class ChunkMerger
     {
         // Use the raw reader here: text is passed through as UTF-8 bytes all the way
         // from disk to output, skipping BinaryReader.ReadString's per-record string
-        // allocation. UTF-8 ordering matches StringComparison.Ordinal, so sort order
-        // is preserved without any conversion to UTF-16.
+        // allocation. Ordering is raw UTF-8 lexicographic byte order (done via
+        // ReadOnlySpan<byte>.SequenceCompareTo inside RawLineEntry.CompareTo), which
+        // is equivalent to Unicode code-point order — NOT StringComparison.Ordinal.
+        // The two AGREE for code points below U+D800 but DISAGREE on supplementary-
+        // plane code points (U+10000+) versus BMP high range (U+E000..U+FFFF) —
+        // see CrossStrategyParityTests for the exact witness. The Phase 1 chunks
+        // were sorted under the same UTF-8 byte order, so the merge preserves order
+        // without any UTF-16 round-trip.
         var readers = new IRawChunkReader[inputFiles.Count];
         try
         {

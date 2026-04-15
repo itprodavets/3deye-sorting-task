@@ -132,14 +132,23 @@ public class MmfSorterTests : IDisposable
             .Where(l => l.Length > 0).ToArray();
         result.Should().HaveCount(5000);
 
-        // Verify sort order: text alphabetically, then number ascending
+        // Verify sort order: text in UTF-8 lexicographic byte order (the actual sort
+        // contract — see RawLineEntry / EntryIndex), then number ascending.
+        // UTF-8 byte order is equivalent to Unicode code-point order and is NOT the
+        // same as StringComparison.Ordinal (which is UTF-16 code-unit order and
+        // diverges on supplementary-plane code points — see CrossStrategyParityTests).
+        // For this test's ASCII-only generator (`$"{i}. Line{i % 10}"`) the two would
+        // coincide, but the assertion uses UTF-8 bytes directly so the contract is
+        // self-evident from the test and survives future data changes.
         for (var i = 1; i < result.Length; i++)
         {
             var prev = LineParser.Parse(result[i - 1]);
             var curr = LineParser.Parse(result[i]);
-            var cmp = string.Compare(prev.Text, curr.Text, StringComparison.Ordinal);
+            var prevUtf8 = System.Text.Encoding.UTF8.GetBytes(prev.Text);
+            var currUtf8 = System.Text.Encoding.UTF8.GetBytes(curr.Text);
+            var cmp = prevUtf8.AsSpan().SequenceCompareTo(currUtf8);
             cmp.Should().BeLessThanOrEqualTo(0,
-                $"line {i - 1} '{result[i - 1]}' should come before '{result[i]}'");
+                $"line {i - 1} '{result[i - 1]}' should come before '{result[i]}' in UTF-8 byte order");
 
             if (cmp == 0)
                 prev.Number.Should().BeLessThanOrEqualTo(curr.Number);
