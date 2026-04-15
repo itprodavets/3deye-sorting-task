@@ -111,8 +111,11 @@ public sealed class ExternalSorter : IFileSorter
     private async Task<List<string>> SplitAndSortAsync(
         string inputPath, string tempDir, IProgress<string>? progress, CancellationToken ct)
     {
-        var workerCount = _options.SortWorkers;
-        var sortParallelism = Math.Max(2, Environment.ProcessorCount / workerCount);
+        // Cap workers by the total parallelism budget so "--threads 2" never spawns 4 workers.
+        var workerCount = Math.Max(1, Math.Min(_options.SortWorkers, _options.MaxDegreeOfParallelism));
+        // Segments per chunk = leftover CPU budget after workers. Minimum 2 so large chunks
+        // still benefit from parallel sort even when the budget is tight.
+        var sortParallelism = Math.Max(2, _options.MaxDegreeOfParallelism / workerCount);
 
         var channel = Channel.CreateBounded<ChunkPayload>(
             new BoundedChannelOptions(workerCount)
