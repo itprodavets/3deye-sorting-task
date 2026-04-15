@@ -23,8 +23,10 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-SIZES=("10MB" "50MB" "200MB")
-STRATEGIES=("stream" "mmf")
+# Size matrix is env-overridable so ad-hoc local runs (e.g. "BENCH_SIZES='10GB 100GB' ./scripts/bench.sh")
+# don't require editing the script. Default matrix sized to fit GitHub Actions runners (16 GB RAM, 14 GB SSD).
+SIZES=(${BENCH_SIZES:-"10MB 50MB 200MB 1GB"})
+STRATEGIES=(${BENCH_STRATEGIES:-"stream mmf"})
 SEED=42
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
