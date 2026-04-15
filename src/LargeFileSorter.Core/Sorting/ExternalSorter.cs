@@ -150,10 +150,26 @@ public sealed class ExternalSorter : IFileSorter
         var chunkPaths = new List<string>();
         var pathLock = new Lock();
 
+        // The reader MUST always complete the channel writer — on happy path with
+        // Complete(), on failure with Complete(ex). If ReadInputAsync throws (e.g.
+        // FormatException on a malformed line) and we skip Complete(), the worker
+        // `await foreach (… ReadAllAsync)` loops hang forever on a never-closed
+        // channel and the Task.WhenAll below wedges the whole sort. Propagating the
+        // exception via Complete(ex) makes ReadAllAsync throw on consumers, which
+        // unwinds them cleanly and lets the producer's original exception surface
+        // through WhenAll as the method's thrown exception.
         var readerTask = Task.Run(async () =>
         {
-            await ReadInputAsync(inputPath, channel.Writer, progress, ct);
-            channel.Writer.Complete();
+            try
+            {
+                await ReadInputAsync(inputPath, channel.Writer, progress, ct);
+                channel.Writer.Complete();
+            }
+            catch (Exception ex)
+            {
+                channel.Writer.Complete(ex);
+                throw;
+            }
         }, ct);
 
         // Spawn N sort workers — Channel ensures each chunk is processed by exactly one worker.
@@ -187,8 +203,16 @@ public sealed class ExternalSorter : IFileSorter
             }, ct);
         }
 
-        await readerTask;
-        await Task.WhenAll(sortTasks);
+        // Await reader + all workers together. Two reasons over the old
+        // `await readerTask; await Task.WhenAll(sortTasks)` pattern:
+        //   1. If the reader faults, we still wait for workers to drain their
+        //      exception (via Complete(ex)) — no orphaned tasks hanging around
+        //      with open FileStream handles while the outer finally tries to
+        //      delete tempDir.
+        //   2. WhenAll surfaces the first exception from any task; the reader's
+        //      original FormatException / IOException wins because consumers
+        //      only faulted as a downstream effect.
+        await Task.WhenAll([readerTask, .. sortTasks]);
 
         chunkPaths.Sort(StringComparer.Ordinal);
         return chunkPaths;

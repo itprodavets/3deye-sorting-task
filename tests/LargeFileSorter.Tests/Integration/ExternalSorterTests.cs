@@ -179,4 +179,53 @@ public class ExternalSorterTests : IDisposable
         var outputLines = await File.ReadAllLinesAsync(output);
         outputLines.Length.Should().Be(inputLines.Length);
     }
+
+    /// <summary>
+    /// Regression: when the Phase 1 producer (<c>ReadInputAsync</c>) throws on a malformed
+    /// line, it must propagate the exception to the consumer workers so they stop waiting
+    /// on <see cref="System.Threading.Channels.ChannelReader{T}.ReadAllAsync"/>.
+    ///
+    /// <b>The bug</b>: previously the reader task was <c>await ReadInputAsync(...);
+    /// channel.Writer.Complete();</c> with no try/catch. If the producer threw, the
+    /// <c>Complete()</c> call was skipped and the worker <c>await foreach</c> loops sat
+    /// forever on a never-completed channel. The fix wraps the producer in try/catch and
+    /// calls <see cref="System.Threading.Channels.ChannelWriter{T}.Complete(Exception?)"/>
+    /// — the consumers observe the exception via <c>ReadAllAsync</c> and unwind cleanly.
+    ///
+    /// <b>Why the hard 30 s timeout matters</b>: pre-fix the top-level <c>SortAsync</c>
+    /// still appeared to return promptly because its <c>await Task.WhenAll</c> (now over
+    /// reader + workers) would never complete — the test would hang indefinitely under
+    /// xUnit, not just leak a task. The bounded CTS guarantees the test fails loudly
+    /// rather than wedging CI.
+    /// </summary>
+    [Fact]
+    public async Task SortAsync_ProducerFailsOnMalformedLine_DoesNotHangWorkers()
+    {
+        var input = Path.Combine(_tempDir, "bad.txt");
+        var output = Path.Combine(_tempDir, "out.txt");
+
+        // Many valid lines → the reader primes the channel and workers pick up at least
+        // one chunk before the malformed line fires. Small chunk budget forces multiple
+        // chunks to flow so sortTasks are actively consuming when the producer faults.
+        var lines = Enumerable.Range(1, 5000)
+            .Select(i => $"{i}. Line{i}")
+            .Append("not-a-valid-line")   // no '.' separator → FormatException
+            .ToList();
+        await File.WriteAllLinesAsync(input, lines);
+
+        var sorter = new ExternalSorter(new SortOptions
+        {
+            TempDirectory = _tempDir,
+            MaxMemoryPerChunk = 4096,
+            SortWorkers = 4
+        });
+
+        using var hardTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        Func<Task> act = () => sorter.SortAsync(input, output, ct: hardTimeout.Token);
+
+        await act.Should().ThrowAsync<FormatException>();
+        hardTimeout.IsCancellationRequested.Should().BeFalse(
+            "SortAsync must surface the producer's FormatException without hanging on " +
+            "worker tasks that are still awaiting channel closure");
+    }
 }
