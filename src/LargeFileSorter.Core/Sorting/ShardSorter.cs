@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Runtime;
+using System.Runtime.InteropServices;
 
 namespace LargeFileSorter.Core;
 
@@ -27,12 +28,21 @@ namespace LargeFileSorter.Core;
 /// <b>When it doesn't:</b> I/O-bound workloads (spinning rust, tiny files where merge is
 /// already &lt; 100 ms). In those cases the split-phase overhead outweighs the merge parallelism.
 /// </summary>
-public sealed class ShardSorter : IFileSorter
+public sealed partial class ShardSorter : IFileSorter
 {
-    // macOS default RLIMIT_NOFILE is 256. Each shard holds (chunks + 1) file descriptors open
-    // concurrently during merge. This cap leaves headroom for the runtime's own fds (stdout,
-    // pipes, socket), and on Linux — which allows 1024+ by default — it just caps cleanly.
-    private const int FileDescriptorBudget = 200;
+    // Headroom reserved for the runtime itself (stdout/stderr, GC/finalizer pipes, JIT
+    // background threads' file handles, the Phase 1 input pipe, etc). 64 is generous —
+    // measured peak in steady-state Phase 2 is ~12.
+    private const int RuntimeFdReserve = 64;
+
+    // Hard floor so we never starve below 200 even if rlimit query fails or the OS
+    // reports a comically low value. 200 was the previous static budget and known-safe
+    // on macOS launchd's 256 default.
+    private const int MinFdBudget = 200;
+
+    // Cached per-process — rlimit is a syscall and the value doesn't change at runtime
+    // unless setrlimit is called explicitly (which we don't do).
+    public static readonly int FileDescriptorBudget = QueryFileDescriptorBudget();
 
     private readonly SortOptions _options;
 
@@ -151,14 +161,20 @@ public sealed class ShardSorter : IFileSorter
     // -------------------------------------------------------------------
 
     /// <summary>
-    /// Picks a shard count that respects both the user's parallelism budget and the
-    /// OS file-descriptor limit. Each parallel merge needs (chunks + 1) fds, so for
-    /// large chunk counts we must reduce shards to stay under the budget.
+    /// Picks a shard count that respects both the user's parallelism budget and the OS file
+    /// descriptor limit. Per-shard FD usage at merge time is bounded by <c>MergeWidth + 1</c>,
+    /// not the full sub-chunk count — <see cref="ChunkMerger.MergeAll"/> cascades multi-level
+    /// merges, so it never opens more than <see cref="SortOptions.MergeWidth"/> readers at once.
+    /// The earlier "(chunkCount + 2)" formula was 30× too pessimistic at 86 chunks: it picked
+    /// 2 shards even at --threads 16, kneecapping the whole point of the strategy.
     /// </summary>
     private int PickShardCount(int chunkCount)
     {
         var requested = Math.Max(2, _options.MaxDegreeOfParallelism);
-        var fdCapped = Math.Max(2, FileDescriptorBudget / (chunkCount + 2));
+        // Per-shard peak FDs: min(actual sub-chunks, mergeWidth) for readers + 1 writer.
+        // Capped at chunkCount because shards with fewer sub-chunks than mergeWidth open fewer.
+        var perShardFds = Math.Min(chunkCount, _options.MergeWidth) + 1;
+        var fdCapped = Math.Max(2, FileDescriptorBudget / perShardFds);
         return Math.Min(requested, fdCapped);
     }
 
@@ -350,7 +366,13 @@ public sealed class ShardSorter : IFileSorter
                 }
                 else
                 {
-                    merger.MergeAll(shardFiles, shardOut, tempDir, progress: null, innerCt);
+                    // Each parallel merge needs its OWN temp directory: ChunkMerger names
+                    // intermediate files "merge_L{level}_{group:D4}.bin" and 16 shards sharing
+                    // the same tempDir collide on merge_L0_0000.bin. Per-shard subdirs are
+                    // free and keep the merger oblivious to the parallelism above it.
+                    var shardTempDir = Path.Combine(tempDir, $"shard_{shardIdx:D3}_work");
+                    Directory.CreateDirectory(shardTempDir);
+                    merger.MergeAll(shardFiles, shardOut, shardTempDir, progress: null, innerCt);
                 }
                 shardOutputs[shardIdx] = shardOut;
 
@@ -433,4 +455,60 @@ public sealed class ShardSorter : IFileSorter
         try { if (File.Exists(path)) File.Delete(path); }
         catch { /* best-effort cleanup */ }
     }
+
+    // -------------------------------------------------------------------
+    //  rlimit query — the right budget is what the OS actually allows,
+    //  not a hardcoded guess. Source-generated LibraryImport for AOT.
+    // -------------------------------------------------------------------
+
+    /// <summary>
+    /// Queries <c>getrlimit(RLIMIT_NOFILE)</c> on Unix to discover the actual per-process
+    /// file-descriptor soft limit, then subtracts a runtime reserve. Falls back to
+    /// <see cref="MinFdBudget"/> on Windows, on syscall failure, or when the limit comes
+    /// back unreasonably low. Without this query we'd hardcode 200 and pin K=2 even when
+    /// the user's shell raised <c>ulimit -n</c> to 64k — kneecapping the parallelism budget
+    /// the strategy is built to exploit.
+    /// </summary>
+    private static int QueryFileDescriptorBudget()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.Linux) &&
+            !RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        {
+            // Windows uses a different model (HANDLEs are not bounded by RLIMIT_NOFILE).
+            // 4096 is generous and well below the default Windows handle table size.
+            return 4096;
+        }
+
+        // RLIMIT_NOFILE differs across Unixes: Linux=7, macOS/BSD=8. Both kernels
+        // accept the wrong constant with EINVAL — try macOS first if running on macOS,
+        // otherwise the Linux value, and accept whichever returns a sane number.
+        var resource = RuntimeInformation.IsOSPlatform(OSPlatform.OSX) ? 8 : 7;
+        try
+        {
+            if (GetRLimit(resource, out var rlim) == 0)
+            {
+                // rlim_cur can be RLIM_INFINITY (~max ulong) when the user set "unlimited".
+                // Cap at a sane maximum so we don't try to open thousands of shard FDs.
+                var limit = rlim.rlim_cur > int.MaxValue ? int.MaxValue : (long)rlim.rlim_cur;
+                var budget = Math.Max(MinFdBudget, (int)Math.Min(limit - RuntimeFdReserve, 8192));
+                return budget;
+            }
+        }
+        catch
+        {
+            // libc missing or platform mismatch — fall through to the safe default.
+        }
+
+        return MinFdBudget;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct Rlimit
+    {
+        public ulong rlim_cur;
+        public ulong rlim_max;
+    }
+
+    [LibraryImport("libc", EntryPoint = "getrlimit")]
+    private static partial int GetRLimit(int resource, out Rlimit rlim);
 }

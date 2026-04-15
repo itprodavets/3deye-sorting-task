@@ -71,6 +71,7 @@ Console.WriteLine($"Chunk memory budget: {SizeFormatter.Format(options.MaxMemory
 Console.WriteLine($"I/O buffer: {SizeFormatter.Format(options.BufferSize)}");
 Console.WriteLine($"Sort workers: {options.SortWorkers}");
 Console.WriteLine($"Parallelism budget: {options.MaxDegreeOfParallelism}");
+Console.WriteLine($"Shard FD budget:    {ShardSorter.FileDescriptorBudget}");
 Console.WriteLine($"Merge width: {options.MergeWidth}");
 
 // Strategy selection:
