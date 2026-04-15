@@ -97,4 +97,18 @@ public class ThreadScalingBenchmarks
         var sorter = new MmfSorter(Options());
         await sorter.SortAsync(_inputFile, output);
     }
+
+    /// <summary>
+    /// Shard strategy: stream Phase 1 + partitioned parallel merge. The whole point of the
+    /// sweep is to see whether shard's parallel merge actually scales with thread count
+    /// where stream's single-threaded merge plateaus — so it shares the same Threads param
+    /// and runs on the exact same input as the other two strategies.
+    /// </summary>
+    [Benchmark(Description = "Shard")]
+    public async Task Shard()
+    {
+        var output = Path.Combine(_tempDir, $"out_shard_{Threads}.txt");
+        var sorter = new ShardSorter(Options());
+        await sorter.SortAsync(_inputFile, output);
+    }
 }

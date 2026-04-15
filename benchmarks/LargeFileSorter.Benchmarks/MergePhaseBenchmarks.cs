@@ -104,9 +104,8 @@ public class MergePhaseBenchmarks
     /// <summary>
     /// Baseline: current ChunkMerger implementation (single-threaded k-way merge
     /// with PriorityQueue + RawLineEntry byte-level output).
-    /// Serves as reference once we add the shard-merge variant in Step C.
     /// </summary>
-    [Benchmark(Baseline = true, Description = "K-way merge (current)")]
+    [Benchmark(Baseline = true, Description = "K-way merge (stream)")]
     public void KWayMerge()
     {
         var merger = new ChunkMerger(
@@ -118,6 +117,29 @@ public class MergePhaseBenchmarks
         // Pass a copy because MergeAll may mutate the list during cascaded merges;
         // we want each iteration to see the same fresh input set.
         merger.MergeAll(new List<string>(_chunkFiles), _outputPath, _tempDir,
+            progress: null, ct: CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Shard merge variant: same pre-built chunks, same output path, same buffer size — only
+    /// the Phase 2 strategy changes. Calls <see cref="ShardSorter.MergeChunksOnlyAsync"/>
+    /// (internal entry-point added specifically for this benchmark) so we measure split +
+    /// parallel merge + concat without including Phase 1 cost. The K-shard count adapts to
+    /// MaxDegreeOfParallelism, which we pin to logical cores so the comparison shows shard's
+    /// best case against the single-threaded baseline.
+    /// </summary>
+    [Benchmark(Description = "Shard merge")]
+    public async Task ShardMerge()
+    {
+        var sorter = new ShardSorter(new SortOptions
+        {
+            BufferSize = 4 * 1024 * 1024,
+            MergeWidth = 64,
+            TempDirectory = _tempDir,
+            MaxDegreeOfParallelism = Environment.ProcessorCount
+        });
+        await sorter.MergeChunksOnlyAsync(
+            new List<string>(_chunkFiles), _outputPath, _tempDir,
             progress: null, ct: CancellationToken.None);
     }
 

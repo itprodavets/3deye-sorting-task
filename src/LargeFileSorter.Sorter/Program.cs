@@ -73,18 +73,31 @@ Console.WriteLine($"Sort workers: {options.SortWorkers}");
 Console.WriteLine($"Parallelism budget: {options.MaxDegreeOfParallelism}");
 Console.WriteLine($"Merge width: {options.MergeWidth}");
 
-// Strategy selection: mmf (memory-mapped, native memory), stream (PipeReader), auto (pick best)
+// Strategy selection:
+//   mmf    — memory-mapped + native memory, best when input fits in one chunk
+//   stream — PipeReader + Channel + single-threaded k-way merge, the workhorse
+//   shard  — stream Phase 1 + partitioned parallel merge, best on multi-core for large files
+//   auto   — pick automatically based on file size and chunk budget
 IFileSorter sorter = strategy switch
 {
     "mmf" => new MmfSorter(options),
     "stream" => new ExternalSorter(options),
+    "shard" => new ShardSorter(options),
     "auto" => inputInfo.Length <= options.MaxMemoryPerChunk
-        ? new MmfSorter(options)  // file fits in one chunk → MMF is optimal
-        : new ExternalSorter(options), // multi-chunk → stream pipeline is better
-    _ => throw new ArgumentException($"Unknown strategy: {strategy}. Use: stream, mmf, auto")
+        ? new MmfSorter(options)                                    // single chunk → MMF
+        : inputInfo.Length >= options.MaxMemoryPerChunk * 4L        // many chunks + multi-core
+          && options.MaxDegreeOfParallelism >= 4
+            ? new ShardSorter(options)                              // → parallel merge
+            : new ExternalSorter(options),                          // few chunks → plain merge
+    _ => throw new ArgumentException($"Unknown strategy: {strategy}. Use: stream, mmf, shard, auto")
 };
 
-var strategyName = sorter is MmfSorter ? "mmf (memory-mapped + native memory)" : "stream (PipeReader + Channel)";
+var strategyName = sorter switch
+{
+    MmfSorter => "mmf (memory-mapped + native memory)",
+    ShardSorter => "shard (stream Phase 1 + partitioned parallel merge)",
+    _ => "stream (PipeReader + Channel)"
+};
 Console.WriteLine($"Strategy: {strategyName}");
 Console.WriteLine();
 

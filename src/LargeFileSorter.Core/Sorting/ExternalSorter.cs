@@ -104,6 +104,28 @@ public sealed class ExternalSorter : IFileSorter
         }
     }
 
+    /// <summary>
+    /// Runs only Phase 1 (chunk sort) and returns the resulting sorted binary chunk files.
+    /// Exposed for <see cref="ShardSorter"/>, which reuses this pipeline unchanged and
+    /// substitutes its own parallel merge for Phase 2. Keeps the two strategies in sync
+    /// on the allocation-heavy split path without copy-pasting ~200 lines of pipeline code.
+    /// </summary>
+    internal async Task<List<string>> SortChunksOnlyAsync(
+        string inputPath, string tempDir, IProgress<string>? progress, CancellationToken ct)
+    {
+        EnsureMinThreads();
+        var previousLatency = GCSettings.LatencyMode;
+        try
+        {
+            GCSettings.LatencyMode = GCLatencyMode.SustainedLowLatency;
+            return await SplitAndSortAsync(inputPath, tempDir, progress, ct);
+        }
+        finally
+        {
+            GCSettings.LatencyMode = previousLatency;
+        }
+    }
+
     // -------------------------------------------------------------------
     //  Phase 1 — PipeReader → parse UTF-8 → Channel → parallel sort → binary write
     // -------------------------------------------------------------------
