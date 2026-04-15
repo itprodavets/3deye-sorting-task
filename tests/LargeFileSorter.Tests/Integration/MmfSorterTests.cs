@@ -146,6 +146,57 @@ public class MmfSorterTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Regression: passing a <c>--memory</c> budget smaller than <c>sizeof(EntryIndex)</c>
+    /// (32 bytes) used to crash the MMF strategy with <c>ArgumentOutOfRangeException</c>
+    /// from <c>NativeBuffer&lt;EntryIndex&gt;</c>'s <c>initialCapacity &gt;= 1</c> check.
+    ///
+    /// The bug was in <see cref="MmfSorter"/>'s budget calculation: <c>MaxMemoryPerChunk /
+    /// sizeof(EntryIndex)</c> rounded to <c>0</c> for budgets under 32 bytes, and the 0 then
+    /// flowed into the NativeBuffer constructor. A floor of 1 entry per chunk makes the
+    /// strategy degrade gracefully (many tiny chunks, merged in multiple passes) instead of
+    /// crashing.
+    ///
+    /// We exercise this with a budget of 16 bytes — half of one EntryIndex — which would
+    /// have raised before the fix. The test asserts both no-crash and correct sort order
+    /// so we don't regress to silent data loss either.
+    /// </summary>
+    [Fact]
+    public async Task SortAsync_BudgetSmallerThanOneEntry_DoesNotCrash()
+    {
+        var input = Path.Combine(_tempDir, "tiny_budget.txt");
+        var output = Path.Combine(_tempDir, "tiny_budget_out.txt");
+
+        var lines = Enumerable.Range(1, 100)
+            .Select(i => $"{i}. Line{i % 5}")
+            .ToArray();
+        await File.WriteAllLinesAsync(input, lines);
+
+        // 16 bytes is strictly less than sizeof(EntryIndex) = 32; pre-fix this crashed.
+        // MergeWidth kept high so we don't blow the FD budget with ~100 one-entry chunks.
+        var options = new SortOptions
+        {
+            MaxMemoryPerChunk = 16,
+            MergeWidth = 128,
+            TempDirectory = _tempDir
+        };
+
+        var sorter = new MmfSorter(options);
+        await sorter.SortAsync(input, output);
+
+        var result = (await File.ReadAllLinesAsync(output))
+            .Where(l => l.Length > 0).ToArray();
+        result.Should().HaveCount(100, "tiny budget must not drop lines silently");
+
+        // Cross-check: same input sorted under a sane budget must produce byte-identical output.
+        var reference = Path.Combine(_tempDir, "tiny_budget_ref.txt");
+        await new MmfSorter(new SortOptions { TempDirectory = _tempDir })
+            .SortAsync(input, reference);
+        (await File.ReadAllBytesAsync(output)).Should()
+            .Equal(await File.ReadAllBytesAsync(reference),
+                "tiny-budget output must equal normal-budget output byte-for-byte");
+    }
+
     [Fact]
     public async Task SortAsync_MatchesStreamStrategy()
     {

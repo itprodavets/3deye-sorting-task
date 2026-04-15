@@ -19,7 +19,7 @@ src/
                                BinaryRawChunkReader, RawLineEntry, Utf8LineWriter)
     EntryIndex.cs              File offset index (28 bytes, no managed refs, NativeMemory)
     NativeBuffer.cs            Growable array via NativeMemory.AlignedAlloc (GC-invisible)
-    LineEntry.cs               Core model with precomputed sort key (UTF-16 prefix)
+    LineEntry.cs               Core model with precomputed sort key (8-byte UTF-8 prefix)
     LineParser.cs              UTF-8 & string parsing
     TextPool.cs                Zero-allocation string interning (AlternateLookup)
     SortOptions.cs             Configuration + HardwareProfile (readonly record struct, auto-tuning)
@@ -416,7 +416,7 @@ The sorter uses a two-phase **external merge sort** with three interchangeable s
 All three strategies share the same binary chunk format produced by Phase 1. Stream and MMF use the single-threaded k-way merge described below; shard uses a partitioned variant covered in the next subsection.
 
 1. **Intermediate merges** (only when chunk count > `MergeWidth`) wrap each chunk in a `BinaryChunkReader` and re-serialize to a new binary chunk — `LineEntry` values are kept in-memory at this level.
-2. **Final merge** (binary → text) wraps each chunk in a **`BinaryRawChunkReader`** that exposes text as a raw UTF-8 byte slice (`RawLineEntry.TextUtf8`) into a reusable buffer. `BinaryReader.ReadString()` is skipped entirely — eliminating ~4.5 billion per-record string allocations at 100 GB scale. UTF-8 lexicographic order matches `StringComparison.Ordinal`, so sort correctness is preserved without converting back to UTF-16.
+2. **Final merge** (binary → text) wraps each chunk in a **`BinaryRawChunkReader`** that exposes text as a raw UTF-8 byte slice (`RawLineEntry.TextUtf8`) into a reusable buffer. `BinaryReader.ReadString()` is skipped entirely — eliminating ~4.5 billion per-record string allocations at 100 GB scale. The order is UTF-8 lexicographic byte order, equivalent to Unicode code-point order — **not** `StringComparison.Ordinal` (which is UTF-16 code-unit order and disagrees with UTF-8 on the supplementary plane). `LineEntry.CompareTo` iterates `Rune.EnumerateRunes()` so every strategy sorts under the same code-point order without converting back to UTF-16.
 3. A `PriorityQueue` (min-heap) selects the smallest entry across all chunk readers. The raw variant uses an 8-byte UTF-8 prefix sort key (`_sortKey`) — same trick as `LineEntry` but applied directly to the bytes, so most comparisons resolve without touching the buffer.
 4. Output is written via `Utf8LineWriter.WriteEntry(long, ReadOnlySpan<byte>)` — formats numbers via `Utf8Formatter.TryFormat` (no `long.ToString()`), and memcopies the already-encoded text bytes straight into a pooled output buffer — no `Encoding.UTF8.GetBytes` call in the final path.
 5. If chunk count exceeds `MergeWidth`, **multi-level merging** groups chunks to stay within file handle limits.
@@ -436,7 +436,7 @@ The trade-off is ~20% extra disk I/O (the split pass rewrites chunk data) in exc
 
 All three entry types use **precomputed sort keys** to avoid full comparisons in the inner loop:
 
-- **Stream Phase 1** (`LineEntry`): first 4 UTF-16 characters packed as a big-endian `ulong`. Resolves ~80% of comparisons with a single integer compare, falling back to `string.Compare(Ordinal)` only when prefixes collide.
+- **Stream Phase 1** (`LineEntry`): first 8 raw UTF-8 bytes packed as a big-endian `ulong` — same sort key as `EntryIndex` and `RawLineEntry`, so all three strategies agree byte-for-byte. Resolves most comparisons with a single integer compare; slow path iterates `Rune.EnumerateRunes()` for allocation-free Unicode code-point order.
 - **MMF Phase 1** (`EntryIndex`): first 8 raw UTF-8 bytes packed as a big-endian `ulong`. Resolves ~90% of comparisons without touching the memory-mapped file, falling back to `SequenceCompareTo` on the MMF byte range.
 - **Phase 2 final merge** (`RawLineEntry`): first 8 raw UTF-8 bytes packed as a big-endian `ulong`. Same fast-path as `EntryIndex` but backed by the reader's buffer — allows byte-level comparison across all chunks without materializing strings.
 

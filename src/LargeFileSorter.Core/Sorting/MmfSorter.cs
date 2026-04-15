@@ -82,8 +82,16 @@ public sealed class MmfSorter : IFileSorter
 
         try
         {
-            var maxEntriesPerChunk = (int)Math.Min(
+            // Floor at 1: if the caller asks for a budget smaller than one EntryIndex
+            // (e.g. --memory 16B, or any value below sizeof(EntryIndex) = 32), integer
+            // division otherwise rounds down to 0 and blows up NativeBuffer's
+            // `initialCapacity >= 1` check with ArgumentOutOfRangeException.
+            // One entry per chunk is grossly inefficient (one chunk file per line) but
+            // the multi-level merge still produces correct output, and users who pass a
+            // pathological budget should see degraded perf, not a crash.
+            var maxEntriesPerChunk = (int)Math.Clamp(
                 _options.MaxMemoryPerChunk / sizeof(EntryIndex),
+                1L,
                 int.MaxValue / 2);
 
             var previousLatency = GCSettings.LatencyMode;
