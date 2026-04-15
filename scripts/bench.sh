@@ -34,6 +34,26 @@ IFS=' ' read -ra SIZES <<<"${BENCH_SIZES:-10MB 50MB 200MB 1GB}"
 # time, which is the correct signal that sharding adds no overhead at small sizes.
 IFS=' ' read -ra STRATEGIES <<<"${BENCH_STRATEGIES:-stream mmf shard}"
 SEED=42
+
+# Per-cell iteration count. Each (size, strategy) cell runs 1 warmup + BENCH_ITERATIONS
+# timed runs, and the minimum timed run is reported. Rationale:
+#   * GitHub Actions shared runners have significant jitter (noisy neighbors, CPU
+#     frequency scaling, transient I/O stalls). A single measurement often swings ±30%
+#     between runs, which was flipping the ranking of strategies that actually differ
+#     by 10-20% — users reading the README couldn't tell which strategy was faster.
+#   * Min-of-N is more reproducible than median for this workload: it captures the
+#     steady-state "no preemption" case. Mean/median drag in tail latency from
+#     whatever else the runner happened to be doing.
+#   * The warmup run primes the OS page cache (so timed runs see warm reads, same as
+#     a CLI user who re-runs a sort) and JITs the hot paths (so timed runs measure
+#     steady-state throughput, not cold-start overhead).
+# Override with BENCH_ITERATIONS=N for faster local iteration (min 1, default 2).
+BENCH_ITERATIONS="${BENCH_ITERATIONS:-2}"
+if ! [[ "$BENCH_ITERATIONS" =~ ^[0-9]+$ ]] || (( BENCH_ITERATIONS < 1 )); then
+    echo "BENCH_ITERATIONS must be a positive integer; got '$BENCH_ITERATIONS'" >&2
+    exit 2
+fi
+
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
@@ -113,48 +133,76 @@ run_one() {
     local size_bytes; size_bytes="$(size_flag_to_bytes "$size")"
     local input="$WORK_DIR/in_${size}.txt"
     local output="$WORK_DIR/out_${size}_${strategy}.txt"
-    local time_file="$WORK_DIR/time_${size}_${strategy}.txt"
-    local sort_log="$WORK_DIR/sort_${size}_${strategy}.log"
 
     if [[ ! -f "$input" ]]; then
         $GENERATOR "$input" "$size" --seed "$SEED" >/dev/null
     fi
 
-    case "$TIME_STYLE" in
-        gnu) /usr/bin/time -v -o "$time_file" $SORTER "$input" "$output" --strategy "$strategy" >"$sort_log" 2>&1 || true ;;
-        bsd) /usr/bin/time -l -o "$time_file" $SORTER "$input" "$output" --strategy "$strategy" >"$sort_log" 2>&1 || true ;;
-        *)   $SORTER "$input" "$output" --strategy "$strategy" >"$sort_log" 2>&1 || true ;;
-    esac
+    # Warmup pass: primes OS page cache + JIT hot paths. Output discarded — we only
+    # want the post-warmup state for the timed runs below.
+    $SORTER "$input" "$output" --strategy "$strategy" >/dev/null 2>&1 || true
 
-    local wall_seconds peak_kb chunks threads
-    wall_seconds="$(parse_completion_seconds < "$sort_log" || true)"
-    peak_kb=""
-    [[ -f "$time_file" ]] && peak_kb="$(peak_kb_from_time_file "$time_file" || true)"
-    chunks="$(parse_chunk_count < "$sort_log" || echo '')"
-    threads="$(parse_threads < "$sort_log" || echo '')"
+    # Timed runs: N iterations, take min. The first timed run still carries warm
+    # caches from the warmup, so we're measuring steady-state throughput. Peak RSS
+    # and chunk count come from the fastest iteration (all runs share the same
+    # deterministic input + strategy, so these values agree across iterations modulo
+    # allocator fragmentation noise).
+    local best_seconds="" best_peak_kb="" best_chunks="" best_threads="" best_status="ok"
+    for ((iter=1; iter <= BENCH_ITERATIONS; iter++)); do
+        local time_file="$WORK_DIR/time_${size}_${strategy}_${iter}.txt"
+        local sort_log="$WORK_DIR/sort_${size}_${strategy}_${iter}.log"
 
-    local in_lines out_lines
-    in_lines="$(wc -l <"$input" | tr -d ' ')"
-    out_lines="$(wc -l <"$output" 2>/dev/null | tr -d ' ' || echo 0)"
-    local status="ok"
-    if [[ "$in_lines" != "$out_lines" || -z "$wall_seconds" ]]; then
-        status="fail"
-    fi
+        case "$TIME_STYLE" in
+            gnu) /usr/bin/time -v -o "$time_file" $SORTER "$input" "$output" --strategy "$strategy" >"$sort_log" 2>&1 || true ;;
+            bsd) /usr/bin/time -l -o "$time_file" $SORTER "$input" "$output" --strategy "$strategy" >"$sort_log" 2>&1 || true ;;
+            *)   $SORTER "$input" "$output" --strategy "$strategy" >"$sort_log" 2>&1 || true ;;
+        esac
+
+        local wall_seconds peak_kb chunks threads
+        wall_seconds="$(parse_completion_seconds < "$sort_log" || true)"
+        peak_kb=""
+        [[ -f "$time_file" ]] && peak_kb="$(peak_kb_from_time_file "$time_file" || true)"
+        chunks="$(parse_chunk_count < "$sort_log" || echo '')"
+        threads="$(parse_threads < "$sort_log" || echo '')"
+
+        # Validate output on every iteration — silent truncation would otherwise hide
+        # behind a fast but wrong run (min over multiple runs would pick it).
+        local in_lines out_lines
+        in_lines="$(wc -l <"$input" | tr -d ' ')"
+        out_lines="$(wc -l <"$output" 2>/dev/null | tr -d ' ' || echo 0)"
+        if [[ "$in_lines" != "$out_lines" || -z "$wall_seconds" ]]; then
+            best_status="fail"
+        fi
+
+        # Track best (minimum) wall time across timed iterations.
+        if [[ -n "$wall_seconds" ]]; then
+            if [[ -z "$best_seconds" ]] || awk -v new="$wall_seconds" -v best="$best_seconds" \
+                'BEGIN { exit !(new < best) }'; then
+                best_seconds="$wall_seconds"
+                best_peak_kb="$peak_kb"
+                best_chunks="$chunks"
+                best_threads="$threads"
+            fi
+        fi
+    done
 
     local throughput="—"
-    if [[ -n "$wall_seconds" && "$wall_seconds" != "0.000" ]]; then
-        throughput="$(awk -v b="$size_bytes" -v t="$wall_seconds" 'BEGIN {printf "%.0f MB/s", b/1048576/t}')"
+    if [[ -n "$best_seconds" && "$best_seconds" != "0.000" ]]; then
+        throughput="$(awk -v b="$size_bytes" -v t="$best_seconds" 'BEGIN {printf "%.0f MB/s", b/1048576/t}')"
     fi
     local peak_human="—"
-    [[ -n "$peak_kb" ]] && peak_human="$(bytes_to_human $((peak_kb * 1024)))"
+    [[ -n "$best_peak_kb" ]] && peak_human="$(bytes_to_human $((best_peak_kb * 1024)))"
     local time_display="—"
-    [[ -n "$wall_seconds" ]] && time_display="$(printf "%.2f s" "$wall_seconds")"
-    local chunks_display="${chunks:-—}"
-    local threads_display="${threads:-—}"
+    [[ -n "$best_seconds" ]] && time_display="$(printf "%.2f s" "$best_seconds")"
+    local chunks_display="${best_chunks:-—}"
+    local threads_display="${best_threads:-—}"
+
+    local in_lines
+    in_lines="$(wc -l <"$input" | tr -d ' ')"
 
     printf "| %s | %s | %'d | %s | %s | %s | %s | %s | %s |\n" \
         "$size" "$strategy" "$in_lines" "$chunks_display" "$threads_display" \
-        "$time_display" "$throughput" "$peak_human" "$status"
+        "$time_display" "$throughput" "$peak_human" "$best_status"
 }
 
 # ---------------------------------------------------------------------------
@@ -213,6 +261,11 @@ BENCH_FRAGMENT="<!-- BENCH:START -->
 > Runner: \`${RUNNER_INFO}\`, .NET ${DOTNET_VERSION}. GitHub Actions shared runners
 > are ~2–3× slower than modern consumer hardware — compare rows within this table,
 > not absolute throughput vs. your workstation.
+>
+> Each cell is the **min of ${BENCH_ITERATIONS} timed runs after 1 warmup** (warmup primes page
+> cache + JIT). Min-of-N is reproducible enough across CI runs to keep strategy
+> rankings stable; single-shot wall time was swinging ±30% run-to-run and flipping
+> which strategy looked fastest. Override iterations with \`BENCH_ITERATIONS=N\`.
 
 | Size | Strategy | Lines | Chunks | Threads | Time | Throughput | Peak RSS | Result |
 |------|----------|-------|-------:|--------:|------|------------|----------|--------|

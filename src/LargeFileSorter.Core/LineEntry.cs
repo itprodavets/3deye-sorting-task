@@ -46,9 +46,36 @@ public readonly struct LineEntry : IComparable<LineEntry>, IEquatable<LineEntry>
         if (_sortKey != other._sortKey)
             return _sortKey.CompareTo(other._sortKey);
 
-        // Slow path: Unicode code-point comparison, which is equivalent to UTF-8
-        // byte-order comparison. Iterating Runes avoids allocating the UTF-8 encoding
-        // up front; the enumerator is a struct, so no heap allocations either.
+        return CompareToSlow(other);
+    }
+
+    // Kept out-of-line so the hot "sort keys differ" path stays tiny and inlines
+    // into Span<LineEntry>.Sort's comparison callback.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private int CompareToSlow(LineEntry other)
+    {
+        // ASCII fast path: when every char on both sides is in [U+0000, U+007F],
+        // UTF-16 code units coincide with UTF-8 bytes 1:1, so string.CompareOrdinal
+        // (SIMD-vectorized in the BCL) yields the same order as UTF-8 byte comparison.
+        // Ascii.IsValid is itself SIMD, so a typical slow-path comparison on realistic
+        // ASCII input costs ~O(len) SIMD cycles instead of per-char Rune decoding.
+        //
+        // Before adding this branch, the P1 correctness fix (replacing StringComparison.Ordinal
+        // with Rune iteration to unify with UTF-8 byte order) roughly doubled stream/shard
+        // Phase 1 sort time on 1 GB input — the Rune enumerator decodes char-by-char where
+        // the old memcmp-based path hit SIMD. For ASCII-only content (which includes the
+        // generator's output and realistic log-style text) the ordering coincides, so the
+        // slow path reclaims the perf without losing Unicode correctness.
+        if (Ascii.IsValid(Text) && Ascii.IsValid(other.Text))
+        {
+            var cmp = string.CompareOrdinal(Text, other.Text);
+            return cmp != 0 ? cmp : Number.CompareTo(other.Number);
+        }
+
+        // Unicode path: at least one side has non-ASCII content. Iterate Runes so
+        // supplementary-plane code points (U+10000+) sort after U+E000..U+FFFF, matching
+        // UTF-8 byte order — see CrossStrategyParityTests for the exact witness.
+        // The enumerator is a struct, so no heap allocations.
         var aIter = Text.EnumerateRunes();
         var bIter = other.Text.EnumerateRunes();
         while (true)
