@@ -60,6 +60,24 @@ parse_completion_seconds() {
     }'
 }
 
+# Chunk count: the sorter prints "Phase 2: merging N sorted chunks..." whenever the
+# input splits into ≥2 chunks. The MMF single-chunk fast path skips Phase 2 entirely,
+# so absence of that line means exactly one chunk was produced.
+parse_chunk_count() {
+    awk '
+        /Phase 2: merging/ {
+            for (i=1; i<=NF; i++) if ($i ~ /^[0-9]+$/) { print $i; found=1; exit }
+        }
+        END { if (!found) print 1 }
+    '
+}
+
+# Parallelism budget — the unified --threads value. Prints on the settings line
+# "Parallelism budget: N". Field 3 after splitting on whitespace.
+parse_threads() {
+    awk '/^Parallelism budget:/ { print $3; exit }'
+}
+
 bytes_to_human() {
     awk -v b="$1" 'BEGIN {
         if (b >= 1073741824) printf "%.2f GB", b/1073741824
@@ -108,10 +126,12 @@ run_one() {
         *)   $SORTER "$input" "$output" --strategy "$strategy" >"$sort_log" 2>&1 || true ;;
     esac
 
-    local wall_seconds peak_kb
+    local wall_seconds peak_kb chunks threads
     wall_seconds="$(parse_completion_seconds < "$sort_log" || true)"
     peak_kb=""
     [[ -f "$time_file" ]] && peak_kb="$(peak_kb_from_time_file "$time_file" || true)"
+    chunks="$(parse_chunk_count < "$sort_log" || echo '')"
+    threads="$(parse_threads < "$sort_log" || echo '')"
 
     local in_lines out_lines
     in_lines="$(wc -l <"$input" | tr -d ' ')"
@@ -129,9 +149,12 @@ run_one() {
     [[ -n "$peak_kb" ]] && peak_human="$(bytes_to_human $((peak_kb * 1024)))"
     local time_display="—"
     [[ -n "$wall_seconds" ]] && time_display="$(printf "%.2f s" "$wall_seconds")"
+    local chunks_display="${chunks:-—}"
+    local threads_display="${threads:-—}"
 
-    printf "| %s | %s | %'d | %s | %s | %s | %s |\n" \
-        "$size" "$strategy" "$in_lines" "$time_display" "$throughput" "$peak_human" "$status"
+    printf "| %s | %s | %'d | %s | %s | %s | %s | %s | %s |\n" \
+        "$size" "$strategy" "$in_lines" "$chunks_display" "$threads_display" \
+        "$time_display" "$throughput" "$peak_human" "$status"
 }
 
 # ---------------------------------------------------------------------------
@@ -191,8 +214,8 @@ BENCH_FRAGMENT="<!-- BENCH:START -->
 > are ~2–3× slower than modern consumer hardware — compare rows within this table,
 > not absolute throughput vs. your workstation.
 
-| Size | Strategy | Lines | Time | Throughput | Peak RSS | Result |
-|------|----------|-------|------|------------|----------|--------|
+| Size | Strategy | Lines | Chunks | Threads | Time | Throughput | Peak RSS | Result |
+|------|----------|-------|-------:|--------:|------|------------|----------|--------|
 ${BENCH_ROWS}<!-- BENCH:END -->"
 
 TESTS_FRAGMENT="<!-- TESTS:START -->
