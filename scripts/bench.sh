@@ -28,7 +28,11 @@ done
 # Use `read -ra` so the unset-default branch word-splits correctly; plain $(array=(${var:-"a b c"}))
 # keeps the default as a single quoted element.
 IFS=' ' read -ra SIZES <<<"${BENCH_SIZES:-10MB 50MB 200MB 1GB}"
-IFS=' ' read -ra STRATEGIES <<<"${BENCH_STRATEGIES:-stream mmf}"
+# shard joins the matrix so the README table shows when partitioned parallel merge wins
+# vs single-threaded k-way merge. With default chunk budget, sub-1GB inputs stay single-chunk
+# and shard takes its single-chunk fast path — the shard column then matches stream's wall
+# time, which is the correct signal that sharding adds no overhead at small sizes.
+IFS=' ' read -ra STRATEGIES <<<"${BENCH_STRATEGIES:-stream mmf shard}"
 SEED=42
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
