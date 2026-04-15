@@ -9,6 +9,15 @@ namespace LargeFileSorter.Core;
 /// K-way merge for sorted binary chunk files.
 /// Supports multi-level merging when the number of chunks exceeds the merge width.
 /// Depends on <see cref="IChunkReader"/> via a factory delegate (DIP).
+///
+/// Two reader paths are used:
+/// <list type="bullet">
+///   <item>Intermediate merges (binary → binary) use <see cref="IChunkReader"/> —
+///     entries need to be re-serialized as strings anyway for the next merge level.</item>
+///   <item>Final merge (binary → text) uses <see cref="IRawChunkReader"/> —
+///     text is passed through as raw UTF-8 bytes, skipping the ReadString
+///     allocation entirely (~4.5 billion allocations saved at 100 GB scale).</item>
+/// </list>
 /// </summary>
 internal sealed class ChunkMerger
 {
@@ -17,12 +26,18 @@ internal sealed class ChunkMerger
     private readonly int _bufferSize;
     private readonly int _mergeWidth;
     private readonly Func<string, IChunkReader> _readerFactory;
+    private readonly Func<string, IRawChunkReader> _rawReaderFactory;
 
-    public ChunkMerger(int bufferSize, int mergeWidth, Func<string, IChunkReader> readerFactory)
+    public ChunkMerger(
+        int bufferSize,
+        int mergeWidth,
+        Func<string, IChunkReader> readerFactory,
+        Func<string, IRawChunkReader> rawReaderFactory)
     {
         _bufferSize = bufferSize;
         _mergeWidth = mergeWidth;
         _readerFactory = readerFactory;
+        _rawReaderFactory = rawReaderFactory;
     }
 
     public void MergeAll(
@@ -92,13 +107,17 @@ internal sealed class ChunkMerger
 
     private void KWayMergeToText(List<string> inputFiles, string outputPath, CancellationToken ct)
     {
-        var readers = new IChunkReader[inputFiles.Count];
+        // Use the raw reader here: text is passed through as UTF-8 bytes all the way
+        // from disk to output, skipping BinaryReader.ReadString's per-record string
+        // allocation. UTF-8 ordering matches StringComparison.Ordinal, so sort order
+        // is preserved without any conversion to UTF-16.
+        var readers = new IRawChunkReader[inputFiles.Count];
         try
         {
-            var pq = new PriorityQueue<int, LineEntry>(inputFiles.Count);
+            var pq = new PriorityQueue<int, RawLineEntry>(inputFiles.Count);
             for (var i = 0; i < inputFiles.Count; i++)
             {
-                readers[i] = _readerFactory(inputFiles[i]);
+                readers[i] = _rawReaderFactory(inputFiles[i]);
                 if (readers[i].HasCurrent)
                     pq.Enqueue(i, readers[i].Current);
             }
@@ -114,7 +133,7 @@ internal sealed class ChunkMerger
             {
                 ct.ThrowIfCancellationRequested();
                 pq.TryDequeue(out var readerIdx, out var entry);
-                writer.WriteEntry(entry);
+                writer.WriteEntry(entry.Number, entry.TextUtf8);
                 readers[readerIdx].Advance();
                 if (readers[readerIdx].HasCurrent)
                     pq.Enqueue(readerIdx, readers[readerIdx].Current);

@@ -66,6 +66,42 @@ internal sealed class Utf8LineWriter : IDisposable
         _buffer[_position++] = (byte)'\n';
     }
 
+    /// <summary>
+    /// Writes an entry whose text is already UTF-8 encoded — skips the
+    /// <see cref="Encoding.UTF8.GetBytes(string, Span{byte})"/> call entirely.
+    /// Used by the final merge pass with <see cref="BinaryRawChunkReader"/>
+    /// to avoid the ReadString → new string → GetBytes roundtrip
+    /// (≈ 4.5 billion allocations eliminated at 100 GB scale).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void WriteEntry(long number, ReadOnlySpan<byte> textUtf8)
+    {
+        // Worst case: 20 digits (long) + 2 (". ") + text bytes (already encoded) + 1 (\n)
+        int maxNeeded = 20 + 2 + textUtf8.Length + 1;
+
+        if (_position + maxNeeded > _buffer.Length)
+            Flush();
+
+        if (maxNeeded > _buffer.Length)
+        {
+            WriteEntryDirect(number, textUtf8);
+            return;
+        }
+
+        var span = _buffer.AsSpan(_position);
+
+        Utf8Formatter.TryFormat(number, span, out var written);
+        _position += written;
+
+        SeparatorBytes.CopyTo(_buffer.AsSpan(_position));
+        _position += SeparatorBytes.Length;
+
+        textUtf8.CopyTo(_buffer.AsSpan(_position));
+        _position += textUtf8.Length;
+
+        _buffer[_position++] = (byte)'\n';
+    }
+
     public void Flush()
     {
         if (_position > 0)
@@ -93,6 +129,30 @@ internal sealed class Utf8LineWriter : IDisposable
             SeparatorBytes.CopyTo(temp.AsSpan(pos));
             pos += SeparatorBytes.Length;
             pos += Encoding.UTF8.GetBytes(entry.Text, temp.AsSpan(pos));
+            temp[pos++] = (byte)'\n';
+            _stream.Write(temp.AsSpan(0, pos));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(temp);
+        }
+    }
+
+    private void WriteEntryDirect(long number, ReadOnlySpan<byte> textUtf8)
+    {
+        Flush();
+
+        int maxNeeded = 20 + 2 + textUtf8.Length + 1;
+        var temp = ArrayPool<byte>.Shared.Rent(maxNeeded);
+        try
+        {
+            int pos = 0;
+            Utf8Formatter.TryFormat(number, temp.AsSpan(pos), out var written);
+            pos += written;
+            SeparatorBytes.CopyTo(temp.AsSpan(pos));
+            pos += SeparatorBytes.Length;
+            textUtf8.CopyTo(temp.AsSpan(pos));
+            pos += textUtf8.Length;
             temp[pos++] = (byte)'\n';
             _stream.Write(temp.AsSpan(0, pos));
         }

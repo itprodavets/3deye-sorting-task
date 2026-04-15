@@ -88,7 +88,8 @@ public sealed class ExternalSorter : IFileSorter
                 var merger = new ChunkMerger(
                     _options.BufferSize,
                     _options.MergeWidth,
-                    path => new BinaryChunkReader(path, _options.BufferSize));
+                    path => new BinaryChunkReader(path, _options.BufferSize),
+                    path => new BinaryRawChunkReader(path, _options.BufferSize));
                 merger.MergeAll(chunkFiles, outputPath, tempDir, progress, ct);
                 progress?.Report("Done.");
             }
