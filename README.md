@@ -13,24 +13,25 @@ Sort a text file where each line follows the format `<Number>. <String>`:
 ```
 src/
   LargeFileSorter.Core/
-    Abstractions/              Interfaces (IFileSorter, IFileGenerator, IChunkReader)
+    Abstractions/              Interfaces (IFileSorter, IFileGenerator, IChunkReader, IRawChunkReader)
     Sorting/                   Sort pipeline (ExternalSorter, MmfSorter, ChunkSorter,
-                               ChunkMerger, BinaryChunkReader, BinaryChunkWriter, Utf8LineWriter)
+                               ChunkMerger, BinaryChunkReader, BinaryChunkWriter,
+                               BinaryRawChunkReader, RawLineEntry, Utf8LineWriter)
     EntryIndex.cs              File offset index (28 bytes, no managed refs, NativeMemory)
     NativeBuffer.cs            Growable array via NativeMemory.AlignedAlloc (GC-invisible)
-    LineEntry.cs               Core model with precomputed sort key
+    LineEntry.cs               Core model with precomputed sort key (UTF-16 prefix)
     LineParser.cs              UTF-8 & string parsing
     TextPool.cs                Zero-allocation string interning (AlternateLookup)
-    SortOptions.cs             Configuration + HardwareProfile (auto-tuning)
+    SortOptions.cs             Configuration + HardwareProfile (readonly record struct, auto-tuning)
     SizeFormatter.cs           Shared byte-size formatting utility
-    GeneratorOptions.cs        Generator configuration
+    GeneratorOptions.cs        Generator configuration (readonly record struct)
     FileGenerator.cs           Test file generator
   LargeFileSorter.Generator/   CLI tool to generate test files
   LargeFileSorter.Sorter/      CLI tool to sort files
 tests/
   LargeFileSorter.Tests/
     Unit/                      Isolated tests (LineEntry, LineParser, ChunkSorter, BinaryChunkIO,
-                               TextPool, Utf8LineWriter)
+                               BinaryRawChunkReader, TextPool, Utf8LineWriter)
     Integration/               File I/O tests (ExternalSorter, MmfSorter, FileGenerator)
 benchmarks/
   LargeFileSorter.Benchmarks/  Performance benchmarks (BenchmarkDotNet)
@@ -368,17 +369,19 @@ The sorter uses a two-phase **external merge sort** with two interchangeable str
 
 Shared by both strategies — the binary chunk format is identical:
 
-1. Each sorted chunk is wrapped in a **`BinaryChunkReader`** that reads binary records in batches of 8,192, using `BinaryReader.ReadInt64()` + `ReadString()` — no text parsing at all.
-2. A `PriorityQueue` (min-heap) selects the smallest entry across all chunk readers.
-3. Output is written via `Utf8LineWriter` — formats numbers directly to UTF-8 with `Utf8Formatter.TryFormat` (no `long.ToString()` allocation), and uses a pooled byte buffer with bulk flush to minimize syscalls.
-4. If chunk count exceeds `MergeWidth`, **multi-level merging** groups chunks to stay within file handle limits.
+1. **Intermediate merges** (only when chunk count > `MergeWidth`) wrap each chunk in a `BinaryChunkReader` and re-serialize to a new binary chunk — `LineEntry` values are kept in-memory at this level.
+2. **Final merge** (binary → text) wraps each chunk in a **`BinaryRawChunkReader`** that exposes text as a raw UTF-8 byte slice (`RawLineEntry.TextUtf8`) into a reusable buffer. `BinaryReader.ReadString()` is skipped entirely — eliminating ~4.5 billion per-record string allocations at 100 GB scale. UTF-8 lexicographic order matches `StringComparison.Ordinal`, so sort correctness is preserved without converting back to UTF-16.
+3. A `PriorityQueue` (min-heap) selects the smallest entry across all chunk readers. The raw variant uses an 8-byte UTF-8 prefix sort key (`_sortKey`) — same trick as `LineEntry` but applied directly to the bytes, so most comparisons resolve without touching the buffer.
+4. Output is written via `Utf8LineWriter.WriteEntry(long, ReadOnlySpan<byte>)` — formats numbers via `Utf8Formatter.TryFormat` (no `long.ToString()`), and memcopies the already-encoded text bytes straight into a pooled output buffer — no `Encoding.UTF8.GetBytes` call in the final path.
+5. If chunk count exceeds `MergeWidth`, **multi-level merging** groups chunks to stay within file handle limits.
 
 ### Comparison Optimization
 
-Both strategies use **precomputed sort keys** to avoid full comparisons in the inner loop:
+All three entry types use **precomputed sort keys** to avoid full comparisons in the inner loop:
 
-- **Stream** (`LineEntry`): first 4 UTF-16 characters packed as a big-endian `ulong`. Resolves ~80% of comparisons with a single integer compare, falling back to `string.Compare` only when prefixes collide.
-- **MMF** (`EntryIndex`): first 8 raw UTF-8 bytes packed as a big-endian `ulong`. Resolves ~90% of comparisons without touching the memory-mapped file, falling back to `SequenceCompareTo` on the MMF byte range.
+- **Stream Phase 1** (`LineEntry`): first 4 UTF-16 characters packed as a big-endian `ulong`. Resolves ~80% of comparisons with a single integer compare, falling back to `string.Compare(Ordinal)` only when prefixes collide.
+- **MMF Phase 1** (`EntryIndex`): first 8 raw UTF-8 bytes packed as a big-endian `ulong`. Resolves ~90% of comparisons without touching the memory-mapped file, falling back to `SequenceCompareTo` on the MMF byte range.
+- **Phase 2 final merge** (`RawLineEntry`): first 8 raw UTF-8 bytes packed as a big-endian `ulong`. Same fast-path as `EntryIndex` but backed by the reader's buffer — allows byte-level comparison across all chunks without materializing strings.
 
 ### GC & Runtime Tuning
 
@@ -405,7 +408,9 @@ Both strategies use **precomputed sort keys** to avoid full comparisons in the i
 - Chunk memory budget auto-tunes to ~25% of available RAM (cap scales with machine: 1 GB on small, up to 8 GB on 64 GB+).
 - Binary chunk format avoids text re-parsing during merge — only the final output writes text.
 - `Utf8LineWriter` formats output directly to UTF-8 using `Utf8Formatter.TryFormat` — eliminates `long.ToString()` and StreamWriter char→byte encoding overhead.
+- `BinaryRawChunkReader` keeps text as raw UTF-8 byte slices during the final merge — no `string` allocation per record. Eliminates ~4.5 billion allocations in Phase 2 at 100 GB scale; on a 14-chunk 200 MB merge, this trims wall time by ~10% and peak memory by ~12%.
 - All output uses cached `UTF8Encoding(false)` — no BOM in generated files, no per-writer allocation.
+- Config types (`SortOptions`, `GeneratorOptions`, `HardwareProfile`) are `readonly record struct` — no heap allocation for configuration, JIT inlines field reads inside sort workers.
 
 **Stream strategy:**
 - Custom `ArrayPool<LineEntry>` (32M max) reuses chunk arrays across iterations — the default `Shared` pool only handles up to ~1M elements.

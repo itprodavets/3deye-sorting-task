@@ -1,7 +1,23 @@
 namespace LargeFileSorter.Core;
 
-public sealed class SortOptions
+/// <summary>
+/// Runtime configuration for the sorter.
+///
+/// Declared as a <see langword="readonly record struct"/> rather than a class —
+/// config is small (≈ 32 bytes), immutable, and passed by value a handful of times
+/// at startup. Value-type semantics avoid a GC allocation per construction and
+/// let the JIT inline field reads inside sort workers.
+/// </summary>
+public readonly record struct SortOptions
 {
+    /// <summary>
+    /// Parameterless constructor is required so that property initializers run
+    /// when the struct is created via <c>new SortOptions()</c> or an object
+    /// initializer. Without it, <c>default(SortOptions)</c> would bypass
+    /// the initializers and produce zero values.
+    /// </summary>
+    public SortOptions() { }
+
     /// <summary>
     /// Maximum memory budget per chunk (in bytes).
     /// Default: auto-scales to the machine — 25% of available RAM,
@@ -19,7 +35,7 @@ public sealed class SortOptions
     /// Directory for temporary chunk files. Uses system temp if not specified.
     /// Point to a fast SSD (ideally NVMe) for best performance.
     /// </summary>
-    public string? TempDirectory { get; init; }
+    public string? TempDirectory { get; init; } = null;
 
     /// <summary>
     /// I/O buffer size for file streams and writers.
@@ -94,8 +110,10 @@ public sealed class SortOptions
 
 /// <summary>
 /// Snapshot of auto-detected hardware used for diagnostics and tuning visibility.
+/// Value type — the profile is a small immutable record that's logged once at startup
+/// and never mutated. Using a struct avoids a GC allocation for the snapshot.
 /// </summary>
-public sealed class HardwareProfile
+public readonly record struct HardwareProfile
 {
     public long TotalMemoryBytes { get; }
     public int LogicalCores { get; }
@@ -103,7 +121,10 @@ public sealed class HardwareProfile
     public int DefaultBufferSize { get; }
     public int SortWorkers { get; }
 
-    internal HardwareProfile()
+    // Parameterless struct constructor must be public (C# rules for record struct).
+    // Behaviourally equivalent to SortOptions.DetectHardware() — both paths produce
+    // the same snapshot by reading Environment/GC.GetGCMemoryInfo().
+    public HardwareProfile()
     {
         try
         {
