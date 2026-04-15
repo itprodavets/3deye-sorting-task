@@ -299,6 +299,26 @@ The tables below are **regenerated automatically** by [`.github/workflows/benchm
 
 > **Note on absolute numbers.** GitHub's shared runners are 2-core VMs with ~7 GB RAM and are typically **2–3× slower** than modern consumer hardware. Use the table to compare **rows** (e.g. `stream` vs `mmf` on the same size) — not absolute throughput against your workstation. For a locally-measured run on beefy hardware, invoke `scripts/bench.sh` directly.
 
+### Large-File Reference Run (100 GB)
+
+The CI matrix tops out at 1 GB because GitHub's shared runners have only 14 GB of disk. Below is a one-shot reference run on a single 100 GB file, measured on my own workstation:
+
+| Size | Strategy | Lines | Time | Throughput | Peak RSS | Chunks |
+|------|----------|------:|-----:|-----------:|---------:|-------:|
+| 100 GB | stream | 4 456 315 686 | **11:04.24** | 154 MB/s | 20 GB | 17 |
+
+Hardware: Apple M4 Max (16 cores), 64 GB RAM, APFS SSD, .NET 10.0.102, macOS.
+
+Run command:
+
+```bash
+dotnet run --project src/LargeFileSorter.Generator -c Release -- data/input_100gb.txt 100GB --seed 42
+/usr/bin/time -l dotnet run --project src/LargeFileSorter.Sorter -c Release -- \
+    data/input_100gb.txt data/sorted_100gb.txt --strategy stream
+```
+
+Verified after the run: input and output line counts match exactly (4 456 315 686 lines each), first three output lines are `1. Always`, last three are `100000. Yesterday yesterday Honeydew Apple`. To reproduce, use `BENCH_SIZES='100GB' scripts/bench.sh` on a machine with at least ~200 GB of free space.
+
 ### Strategy Comparison: When to Use Which
 
 Both strategies produce **byte-identical output** (verified with MD5). Tradeoffs are qualitative rather than numeric — the CI benchmarks above show the timing for the current commit:
