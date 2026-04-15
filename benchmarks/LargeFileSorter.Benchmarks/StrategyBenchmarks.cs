@@ -8,7 +8,7 @@ using LargeFileSorter.Core;
 namespace LargeFileSorter.Benchmarks;
 
 /// <summary>
-/// Head-to-head comparison of the two <see cref="IFileSorter"/> strategies.
+/// Head-to-head comparison of the three <see cref="IFileSorter"/> strategies.
 ///
 /// <b>Stream</b> (PipeReader + Channel + TextPool):
 ///   Concurrent read/sort pipeline. String deduplication via TextPool keeps
@@ -20,9 +20,17 @@ namespace LargeFileSorter.Benchmarks;
 ///   offsets into the MMF; NativeBuffer&lt;EntryIndex&gt; is invisible to GC.
 ///   Eliminates all GC pauses regardless of data cardinality.
 ///
+/// <b>Shard</b> (stream Phase 1 + partitioned parallel merge):
+///   Same Phase 1 as stream, but Phase 2 splits chunks into K disjoint
+///   key-ranges and merges them in parallel. Wins on multi-core when the
+///   input produces many chunks (merge is CPU-bound on the PriorityQueue
+///   pop path). At the default chunk budget a ≤200 MB file is a single
+///   chunk → shard hits its fast path and matches stream.
+///
 /// Each benchmark generates a deterministic file with seed=42 and runs
-/// both strategies on the same data. The "small chunks" variants force
-/// multi-chunk merge to compare the external merge paths.
+/// all three strategies on the same data. The "small chunks" variants
+/// force multi-chunk merge so the external merge paths (and shard's
+/// parallel merge) are actually exercised.
 /// </summary>
 [MemoryDiagnoser]
 [Config(typeof(Config))]
@@ -97,6 +105,19 @@ public class StrategyBenchmarks
     }
 
     /// <summary>
+    /// Shard strategy at default chunk budget. For ≤200 MB inputs this hits
+    /// the single-chunk fast path — the benchmark exists so the "no overhead
+    /// when sharding isn't useful" claim is measured, not asserted.
+    /// </summary>
+    [Benchmark(Description = "Shard (stream Phase 1 + parallel merge)")]
+    public async Task Shard()
+    {
+        var output = Path.Combine(_tempDir, "out_shard.txt");
+        var sorter = new ShardSorter(new SortOptions { TempDirectory = _tempDir });
+        await sorter.SortAsync(_inputFile, output);
+    }
+
+    /// <summary>
     /// Stream with 4 MB chunks — forces multi-chunk external merge.
     /// </summary>
     [Benchmark(Description = "Stream (4MB chunks)")]
@@ -119,6 +140,23 @@ public class StrategyBenchmarks
     {
         var output = Path.Combine(_tempDir, "out_mmf_sm.txt");
         var sorter = new MmfSorter(new SortOptions
+        {
+            MaxMemoryPerChunk = 4 * 1024 * 1024,
+            TempDirectory = _tempDir
+        });
+        await sorter.SortAsync(_inputFile, output);
+    }
+
+    /// <summary>
+    /// Shard with 4 MB chunks — the scenario shard is actually built for:
+    /// many chunks → partitioned parallel merge has work to distribute
+    /// across cores instead of a single-threaded PQ pop loop.
+    /// </summary>
+    [Benchmark(Description = "Shard (4MB chunks)")]
+    public async Task Shard_SmallChunks()
+    {
+        var output = Path.Combine(_tempDir, "out_shard_sm.txt");
+        var sorter = new ShardSorter(new SortOptions
         {
             MaxMemoryPerChunk = 4 * 1024 * 1024,
             TempDirectory = _tempDir
