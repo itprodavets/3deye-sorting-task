@@ -23,10 +23,12 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Size matrix is env-overridable so ad-hoc local runs (e.g. "BENCH_SIZES='10GB 100GB' ./scripts/bench.sh")
+# Size matrix is env-overridable so ad-hoc local runs (e.g. "BENCH_SIZES='10GB 100GB' scripts/bench.sh")
 # don't require editing the script. Default matrix sized to fit GitHub Actions runners (16 GB RAM, 14 GB SSD).
-SIZES=(${BENCH_SIZES:-"10MB 50MB 200MB 1GB"})
-STRATEGIES=(${BENCH_STRATEGIES:-"stream mmf"})
+# Use `read -ra` so the unset-default branch word-splits correctly; plain $(array=(${var:-"a b c"}))
+# keeps the default as a single quoted element.
+IFS=' ' read -ra SIZES <<<"${BENCH_SIZES:-10MB 50MB 200MB 1GB}"
+IFS=' ' read -ra STRATEGIES <<<"${BENCH_STRATEGIES:-stream mmf}"
 SEED=42
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
