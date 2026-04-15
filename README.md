@@ -239,7 +239,7 @@ dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release -- --filte
 
 ### 6. Publish native binaries (NativeAOT)
 
-Ahead-of-time compilation produces a self-contained native binary — no .NET runtime required, ~5 ms startup, ~2.7 MB binary size.
+Ahead-of-time compilation produces a self-contained native binary — no .NET runtime required, near-instant startup, minimal binary footprint.
 
 ```bash
 # Auto-detect platform (macOS/Linux/Windows, arm64/x64)
@@ -265,63 +265,46 @@ The sorter supports graceful cancellation via `Ctrl+C`. It finishes the current 
 
 ## Performance Results
 
-Measured on Apple M4 Max (16 cores), 64 GB RAM, macOS, .NET 10.
+The tables below are **regenerated automatically** by [`.github/workflows/benchmark.yml`](.github/workflows/benchmark.yml) on every push to `main`. No hand-edited numbers — every figure comes from a fresh CI run on the same commit that is currently at `HEAD`.
 
-### Throughput
+### Test Results
 
-| File Size | Lines | Strategy | Chunks | Time | Throughput |
-|-----------|-------|----------|--------|------|------------|
-| 200 MB | 8.7 M | mmf | 1 (single chunk) | 2.1 s | 96 MB/s |
-| 200 MB | 8.7 M | stream | 1 (single chunk) | 2.2 s | 91 MB/s |
-| 1 GB | 44.6 M | stream | 1 (single chunk) | 7.7 s | 134 MB/s |
-| 1 GB | 44.6 M | stream | 6 (256 MB chunks) | 6.3 s | 162 MB/s |
-| 5 GB | 222.8 M | stream | 4 (2 GB chunks) | 29.6 s | 173 MB/s |
+<!-- TESTS:START -->
+_No CI run has updated this block yet. Push to `main` (or trigger the workflow manually) to populate it._
+<!-- TESTS:END -->
 
-> Extrapolated: **100 GB in ~10 minutes** at sustained 173 MB/s (stream, multi-chunk).
+### Benchmarks
 
-### Strategy Comparison: Stream vs MMF
+<!-- BENCH:START -->
+_No CI run has updated this block yet. Push to `main` (or trigger the workflow manually) to populate it._
+<!-- BENCH:END -->
 
-Both strategies produce **byte-identical output** (verified with MD5). The table below compares sort time (excluding JIT warmup) on the same data:
+> **Note on absolute numbers.** GitHub's shared runners are 2-core VMs with ~7 GB RAM and are typically **2–3× slower** than modern consumer hardware. Use the table to compare **rows** (e.g. `stream` vs `mmf` on the same size) — not absolute throughput against your workstation. For a locally-measured run on beefy hardware, invoke `scripts/bench.sh` directly.
 
-**Single chunk (file fits in memory budget):**
+### Strategy Comparison: When to Use Which
 
-| File Size | Phrases | Stream (JIT) | MMF (JIT) | Stream (AOT) | MMF (AOT) |
-|-----------|---------|-------------|-----------|-------------|-----------|
-| 200 MB | 500 | 2.19 s | 2.09 s | 2.76 s | **1.92 s** |
-| 200 MB | 10,000 | 2.21 s | **2.14 s** | — | — |
-| 1 GB | 500 | **7.66 s** | 9.63 s | 9.13 s | 10.44 s |
-
-**Multi-chunk (6 chunks × 256 MB from 1 GB file):**
-
-| Runtime | Stream | MMF | Winner |
-|---------|--------|-----|--------|
-| JIT | **6.33 s** (162 MB/s) | 10.42 s (98 MB/s) | Stream 1.65x |
-| AOT | **7.06 s** (145 MB/s) | 11.29 s (91 MB/s) | Stream 1.60x |
-
-**When to use which:**
+Both strategies produce **byte-identical output** (verified with MD5). Tradeoffs are qualitative rather than numeric — the CI benchmarks above show the timing for the current commit:
 
 | Scenario | Best Strategy | Why |
 |----------|--------------|-----|
 | Low-cardinality text (few unique phrases) | **Stream** | `TextPool` deduplicates strings; comparisons become pointer equality |
 | High-cardinality text (many unique strings) | **MMF** | No `TextPool` overhead; 8-byte sort key resolves 90%+ without memory access |
-| Small files (single chunk, < 500 MB) | **MMF** | Less overhead; no pipeline setup; zero GC pressure |
-| Large files (multi-chunk, > 1 GB) | **Stream** | Concurrent pipeline overlaps I/O and sort; `Channel<T>` keeps all cores busy |
+| Small files (single chunk) | **MMF** | Less overhead; no pipeline setup; zero GC pressure |
+| Large files (multi-chunk) | **Stream** | Concurrent pipeline overlaps I/O and sort; `Channel<T>` keeps all cores busy |
 | Latency-sensitive (GC pauses unacceptable) | **MMF** | `NativeBuffer<EntryIndex>` is invisible to GC — zero pauses regardless of size |
 
-The `auto` strategy (default) picks MMF when the file fits in a single chunk, and stream otherwise. This matches the benchmarks: MMF avoids pipeline overhead for small files, while stream's concurrent pipeline dominates on large multi-chunk workloads.
+The `auto` strategy (default) picks MMF when the file fits in a single chunk, and stream otherwise.
 
 ### JIT vs NativeAOT
 
-| Metric | JIT (.NET 10) | NativeAOT |
+| Aspect | JIT (.NET 10) | NativeAOT |
 |--------|--------------|-----------|
-| Startup time | ~680 ms | **~5 ms** (136x faster) |
-| Binary size | ~97 MB (with runtime) | **2.7 MB** (36x smaller) |
-| 200 MB sort (mmf) | 2.09 s | **1.92 s** (8% faster) |
-| 1 GB sort (stream) | **7.66 s** | 9.13 s (16% slower) |
-| 1 GB multi-chunk (stream) | **6.33 s** | 7.06 s (10% slower) |
-| Runtime optimization | TieredPGO re-compiles hot loops | Static compilation, no profiling |
+| Startup | Slower (CoreCLR boot + TieredPGO warmup) | Near-instant — no runtime dependency |
+| Binary size | Requires installed runtime | Single self-contained native binary |
+| Throughput on sustained sort loops | TieredPGO re-compiles hot methods using profiling data | Static compilation — no runtime profiling |
+| Deployment target | Full .NET environment | Containers, serverless, CLI tools |
 
-**Recommendation:** Use **JIT for large files** — TieredPGO optimizes the sort comparison loop with runtime profiling data, giving 10–16% better throughput on sustained workloads. Use **NativeAOT for deployment** where instant startup and small binary size matter (containers, CLI tools, serverless).
+**Recommendation:** JIT for sustained large-file workloads (TieredPGO wins on hot sort loops), NativeAOT when startup latency or binary footprint dominate.
 
 ### Correctness Verification
 
@@ -393,7 +376,7 @@ All three entry types use **precomputed sort keys** to avoid full comparisons in
 | SustainedLowLatency | both | Suppress full blocking Gen2 during Phase 1 (Gen0/Gen1 still run) |
 | GC.Collect between phases | both | Hint to reclaim Phase 1 allocations before I/O-heavy merge |
 | TieredPGO | JIT | JIT re-compiles hot methods using runtime profiling data |
-| NativeAOT | both | Ahead-of-time compilation: 2.7 MB binary, 5 ms startup, no .NET runtime dependency |
+| NativeAOT | both | Ahead-of-time compilation: single self-contained binary, near-instant startup, no .NET runtime dependency |
 | `NativeMemory.AlignedAlloc` | mmf | GC-invisible growable array (64-byte aligned) for `EntryIndex` entries |
 | `MemoryMappedFile` | mmf | OS-managed page cache; text stays as byte offsets, no string allocation |
 | AggressiveInlining | both | `CompareTo` / `CompareEntries` inlined into sort inner loop |
@@ -408,7 +391,7 @@ All three entry types use **precomputed sort keys** to avoid full comparisons in
 - Chunk memory budget auto-tunes to ~25% of available RAM (cap scales with machine: 1 GB on small, up to 8 GB on 64 GB+).
 - Binary chunk format avoids text re-parsing during merge — only the final output writes text.
 - `Utf8LineWriter` formats output directly to UTF-8 using `Utf8Formatter.TryFormat` — eliminates `long.ToString()` and StreamWriter char→byte encoding overhead.
-- `BinaryRawChunkReader` keeps text as raw UTF-8 byte slices during the final merge — no `string` allocation per record. Eliminates ~4.5 billion allocations in Phase 2 at 100 GB scale; on a 14-chunk 200 MB merge, this trims wall time by ~10% and peak memory by ~12%.
+- `BinaryRawChunkReader` keeps text as raw UTF-8 byte slices during the final merge — no `string` allocation per record. Eliminates ~4.5 billion per-record string allocations in Phase 2 at 100 GB scale; the CI benchmarks above show the end-to-end impact on wall time and peak RSS.
 - All output uses cached `UTF8Encoding(false)` — no BOM in generated files, no per-writer allocation.
 - Config types (`SortOptions`, `GeneratorOptions`, `HardwareProfile`) are `readonly record struct` — no heap allocation for configuration, JIT inlines field reads inside sort workers.
 
@@ -496,7 +479,7 @@ PipeReader + binary chunks + concurrent pipeline + parallel sort + sort key + GC
 
 | Pros | Cons |
 |------|------|
-| 173 MB/s on 5 GB — **~10 min for 100 GB** | More complex implementation |
+| Handles files larger than RAM with sustained sequential throughput — designed for 100 GB+ | More complex implementation |
 | PipeReader — zero per-line allocation for input parsing | String dedup less effective for high-cardinality data |
 | Zero-allocation string deduplication via `AlternateLookup` (.NET 9+) | |
 | Concurrent pipeline — I/O and sort overlap via `Channel<T>` | |
