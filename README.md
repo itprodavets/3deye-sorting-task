@@ -14,7 +14,7 @@ Sort a text file where each line follows the format `<Number>. <String>`:
 src/
   LargeFileSorter.Core/
     Abstractions/              Interfaces (IFileSorter, IFileGenerator, IChunkReader, IRawChunkReader)
-    Sorting/                   Sort pipeline (ExternalSorter, MmfSorter, ChunkSorter,
+    Sorting/                   Sort pipeline (ExternalSorter, MmfSorter, ShardSorter, ChunkSorter,
                                ChunkMerger, BinaryChunkReader, BinaryChunkWriter,
                                BinaryRawChunkReader, RawLineEntry, Utf8LineWriter)
     EntryIndex.cs              File offset index (28 bytes, no managed refs, NativeMemory)
@@ -32,7 +32,7 @@ tests/
   LargeFileSorter.Tests/
     Unit/                      Isolated tests (LineEntry, LineParser, ChunkSorter, BinaryChunkIO,
                                BinaryRawChunkReader, TextPool, Utf8LineWriter)
-    Integration/               File I/O tests (ExternalSorter, MmfSorter, FileGenerator)
+    Integration/               File I/O tests (ExternalSorter, MmfSorter, ShardSorter, FileGenerator)
 benchmarks/
   LargeFileSorter.Benchmarks/  Performance benchmarks (BenchmarkDotNet)
 ```
@@ -173,13 +173,15 @@ dotnet run --project src/LargeFileSorter.Sorter -c Release -- data/test.txt data
 **Example output — auto strategy on 1 GB file (64 GB machine):**
 
 ```
-Hardware: RAM: 64.0 GB, Cores: 16, Chunk budget: 8.0 GB, I/O buffer: 16 MB, Sort workers: 4
+Hardware: RAM: 64.0 GB, Cores: 16, Chunk budget: 8.0 GB, I/O buffer: 16 MB, Sort workers: 4, Parallelism: 16
 
 Input:  data/test.txt (1.0 GB)
 Output: data/sorted.txt
 Chunk memory budget: 8.0 GB
 I/O buffer: 16 MB
 Sort workers: 4
+Parallelism budget: 16
+Shard FD budget:    8128
 Merge width: 64
 Strategy: mmf (memory-mapped + native memory)
 
@@ -194,13 +196,15 @@ Output size: 1.0 GB
 **Example output — stream strategy on 1 GB file with 256 MB chunks:**
 
 ```
-Hardware: RAM: 64.0 GB, Cores: 16, Chunk budget: 8.0 GB, I/O buffer: 16 MB, Sort workers: 4
+Hardware: RAM: 64.0 GB, Cores: 16, Chunk budget: 8.0 GB, I/O buffer: 16 MB, Sort workers: 4, Parallelism: 16
 
 Input:  data/test.txt (1.0 GB)
 Output: data/sorted.txt
 Chunk memory budget: 256 MB
 I/O buffer: 16 MB
 Sort workers: 4
+Parallelism budget: 16
+Shard FD budget:    8128
 Merge width: 64
 Strategy: stream (PipeReader + Channel)
 
@@ -241,11 +245,17 @@ dotnet test --verbosity normal
 Compares sorting strategies and approaches:
 
 ```bash
-# Strategy comparison: stream vs mmf
+# Strategy comparison: stream vs mmf vs shard (head-to-head)
 dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release -- --filter '*Strategy*'
 
 # Approach comparison: naive vs sequential vs optimized
 dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release -- --filter '*Sorting*'
+
+# Thread-scaling sweep (Threads × {1,2,4,8,16}) across all three strategies
+dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release -- --filter '*ThreadScaling*'
+
+# Phase 2 only: stream k-way merge vs shard partitioned parallel merge
+dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release -- --filter '*MergePhase*'
 
 # Run all benchmarks
 dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release -- --filter '*'
@@ -403,13 +413,24 @@ The sorter uses a two-phase **external merge sort** with three interchangeable s
 
 ### Phase 2 — K-Way Merge (buffered)
 
-Shared by both strategies — the binary chunk format is identical:
+All three strategies share the same binary chunk format produced by Phase 1. Stream and MMF use the single-threaded k-way merge described below; shard uses a partitioned variant covered in the next subsection.
 
 1. **Intermediate merges** (only when chunk count > `MergeWidth`) wrap each chunk in a `BinaryChunkReader` and re-serialize to a new binary chunk — `LineEntry` values are kept in-memory at this level.
 2. **Final merge** (binary → text) wraps each chunk in a **`BinaryRawChunkReader`** that exposes text as a raw UTF-8 byte slice (`RawLineEntry.TextUtf8`) into a reusable buffer. `BinaryReader.ReadString()` is skipped entirely — eliminating ~4.5 billion per-record string allocations at 100 GB scale. UTF-8 lexicographic order matches `StringComparison.Ordinal`, so sort correctness is preserved without converting back to UTF-16.
 3. A `PriorityQueue` (min-heap) selects the smallest entry across all chunk readers. The raw variant uses an 8-byte UTF-8 prefix sort key (`_sortKey`) — same trick as `LineEntry` but applied directly to the bytes, so most comparisons resolve without touching the buffer.
 4. Output is written via `Utf8LineWriter.WriteEntry(long, ReadOnlySpan<byte>)` — formats numbers via `Utf8Formatter.TryFormat` (no `long.ToString()`), and memcopies the already-encoded text bytes straight into a pooled output buffer — no `Encoding.UTF8.GetBytes` call in the final path.
 5. If chunk count exceeds `MergeWidth`, **multi-level merging** groups chunks to stay within file handle limits.
+
+### Phase 2 — Shard Strategy (Partitioned Parallel Merge)
+
+The shard strategy replaces step 3 above (single-threaded `PriorityQueue`) with K independent merges running in parallel:
+
+1. **Partition** — first-2-bytes UTF-8 keys are sampled from every chunk to find K−1 split boundaries that balance record counts across shards. K adapts to `MaxDegreeOfParallelism` and the per-shard file-descriptor budget (`RLIMIT_NOFILE` queried at startup).
+2. **Split** — each Phase 1 chunk is scanned once and records are routed to K per-shard writers according to their sort key. Writers are flushed and disposed between chunks so FileStream buffers can't strand data (each shard ends up with K sorted-fragment files, one per original chunk).
+3. **Parallel merge** — K shards are merged concurrently via `Parallel.ForEachAsync`, each using the same `ChunkMerger` as stream/MMF. A per-shard temp subdirectory prevents cascaded-merge filename collisions between shards.
+4. **Concat** — because the partition boundaries are sort-order-preserving, concatenating shard outputs in index order produces the globally sorted result without a final merge pass. Byte-level concat via `Stream.CopyTo` using the configured `--buffer` size (auto 1–16 MB).
+
+The trade-off is ~20% extra disk I/O (the split pass rewrites chunk data) in exchange for parallelism on Phase 2, which is the single-threaded bottleneck on multi-core machines when chunk count is high.
 
 ### Comparison Optimization
 
@@ -423,24 +444,26 @@ All three entry types use **precomputed sort keys** to avoid full comparisons in
 
 | Optimization | Strategy | Purpose |
 |-------------|----------|---------|
-| Server GC | both | One heap per logical core, parallel collection threads |
-| Concurrent GC | both | Background Gen2 — application threads never block |
-| RetainVM | both | Keep committed pages after GC; next chunk reuses same memory without kernel call |
-| SustainedLowLatency | both | Suppress full blocking Gen2 during Phase 1 (Gen0/Gen1 still run) |
-| GC.Collect between phases | both | Hint to reclaim Phase 1 allocations before I/O-heavy merge |
+| Server GC | all | One heap per logical core, parallel collection threads |
+| Concurrent GC | all | Background Gen2 — application threads never block |
+| RetainVM | all | Keep committed pages after GC; next chunk reuses same memory without kernel call |
+| SustainedLowLatency | all | Suppress full blocking Gen2 during Phase 1 (Gen0/Gen1 still run) |
+| GC.Collect between phases | all | Hint to reclaim Phase 1 allocations before I/O-heavy merge |
 | TieredPGO | JIT | JIT re-compiles hot methods using runtime profiling data |
-| NativeAOT | both | Ahead-of-time compilation: single self-contained binary, near-instant startup, no .NET runtime dependency |
+| NativeAOT | all | Ahead-of-time compilation: single self-contained binary, near-instant startup, no .NET runtime dependency |
 | `NativeMemory.AlignedAlloc` | mmf | GC-invisible growable array (64-byte aligned) for `EntryIndex` entries |
 | `MemoryMappedFile` | mmf | OS-managed page cache; text stays as byte offsets, no string allocation |
-| AggressiveInlining | both | `CompareTo` / `CompareEntries` inlined into sort inner loop |
-| `[SkipLocalsInit]` | both | No stack zeroing on hot paths (TextPool, Utf8LineWriter, LineEntry, ChunkSorter, MmfSorter) |
-| `SearchValues<byte>` | both | SIMD-accelerated separator / newline search per platform |
-| `Span<T>.Sort()` | both | Span-based sort avoids Array.Sort bounds validation overhead |
-| ThreadPool pre-warm | both | SetMinThreads = ProcessorCount to avoid injection stall |
+| `Parallel.ForEachAsync` | shard | K independent k-way merges run concurrently over disjoint key ranges |
+| `getrlimit(RLIMIT_NOFILE)` | shard | Runtime query of the FD budget caps K so parallel merges stay within limits |
+| AggressiveInlining | all | `CompareTo` / `CompareEntries` inlined into sort inner loop |
+| `[SkipLocalsInit]` | all | No stack zeroing on hot paths (TextPool, Utf8LineWriter, LineEntry, ChunkSorter, MmfSorter) |
+| `SearchValues<byte>` | all | SIMD-accelerated separator / newline search per platform |
+| `Span<T>.Sort()` | all | Span-based sort avoids Array.Sort bounds validation overhead |
+| ThreadPool pre-warm | all | SetMinThreads = ProcessorCount to avoid injection stall |
 
 ### Memory Management
 
-**Shared (both strategies):**
+**Shared (all three strategies):**
 - Chunk memory budget auto-tunes to ~25% of available RAM (cap scales with machine: 1 GB on small, up to 8 GB on 64 GB+).
 - Binary chunk format avoids text re-parsing during merge — only the final output writes text.
 - `Utf8LineWriter` formats output directly to UTF-8 using `Utf8Formatter.TryFormat` — eliminates `long.ToString()` and StreamWriter char→byte encoding overhead.
@@ -458,6 +481,12 @@ All three entry types use **precomputed sort keys** to avoid full comparisons in
 - `NativeBuffer<EntryIndex>` stores 28-byte structs in `NativeMemory.AlignedAlloc` (64-byte aligned) — completely invisible to the GC, zero scan overhead regardless of buffer size.
 - Text data stays in the memory-mapped file as byte offsets — no string allocation during index, sort, or chunk write phases.
 - `MemoryMappedFile` delegates page management to the OS kernel — no explicit read buffers needed.
+
+**Shard strategy:**
+- Shares stream's Phase 1 path verbatim (same `ExternalSorter` pipeline, same binary chunk output), so the Phase 1 memory characteristics match stream exactly.
+- Split pass uses one `FileStream` output buffer per shard writer (sized from `--buffer`, auto 1–16 MB); writers are disposed between source chunks so the buffer count is bounded by K, not K × chunkCount.
+- Each parallel shard merge runs its own `ChunkMerger` instance with its own temp subdirectory — no shared mutable state between parallel branches, no locks on the merge path.
+- Shard count K adapts down when the `RLIMIT_NOFILE` budget tightens, so the total open-FD count across all parallel merges stays within system limits.
 
 ### Hardware Auto-Tuning
 
@@ -491,18 +520,19 @@ The stream strategy excels on data with repeating text (string dedup via `TextPo
 
 ### Performance Tuning
 
-| Parameter       | Flag             | Default | Effect                                        |
-|-----------------|------------------|---------|-----------------------------------------------|
-| Strategy        | `--strategy`     | auto    | `stream` (concurrent pipeline), `mmf` (zero GC), `auto` (pick best) |
-| Chunk memory    | `--memory`       | auto (~25% RAM, capped) | Larger = fewer chunks, faster merge phase     |
-| Merge width     | `--merge-width`  | 64      | Wider = fewer merge levels, more file handles |
-| Buffer size     | `--buffer`       | auto (1–16 MB) | Larger = fewer I/O syscalls                   |
-| Sort workers    | `--workers`      | auto (1–4)  | More workers = higher CPU usage, faster sort  |
-| Temp directory  | `--temp-dir`     | system temp | Point to fast SSD for temp files              |
+| Parameter         | Flag             | Default | Effect                                        |
+|-------------------|------------------|---------|-----------------------------------------------|
+| Strategy          | `--strategy`     | auto    | `stream` (concurrent pipeline), `mmf` (zero GC), `shard` (parallel merge), `auto` (pick best) |
+| Chunk memory      | `--memory`       | auto (~25% RAM, capped) | Larger = fewer chunks, faster merge phase     |
+| Merge width       | `--merge-width`  | 64      | Wider = fewer merge levels, more file handles |
+| Buffer size       | `--buffer`       | auto (1–16 MB) | Larger = fewer I/O syscalls                   |
+| Sort workers      | `--workers`      | auto (1–4)  | More workers = higher CPU usage, faster sort  |
+| Parallelism budget| `--threads`      | logical cores | Shared budget across workers / segments / shards — pin the same N across strategies for fair comparison |
+| Temp directory    | `--temp-dir`     | system temp | Point to fast SSD for temp files              |
 
 ## Algorithm Comparison
 
-The benchmark suite (`dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release`) compares four approaches to justify the design:
+The benchmark suite (`dotnet run --project benchmarks/LargeFileSorter.Benchmarks -c Release`) compares the following approaches to justify the design:
 
 ### 1. Naive In-Memory Sort
 
@@ -559,6 +589,18 @@ MemoryMappedFile + NativeBuffer&lt;EntryIndex&gt; + pointer-based sort + zero ma
 | NativeAOT-friendly — no reflection, no dynamic code | |
 | Binary chunk output — reuses same `ChunkMerger` for merge phase | |
 
+### 5. Optimized External Sort — Shard Strategy (Partitioned Parallel Merge)
+
+Stream's Phase 1 pipeline + split-by-key-prefix into K shards + `Parallel.ForEachAsync` over independent k-way merges + byte concat.
+
+| Pros | Cons |
+|------|------|
+| Phase 2 scales with cores — removes the single-threaded `PriorityQueue` bottleneck | ~20% extra disk I/O from the split pass rewriting chunk data |
+| Reuses stream's Phase 1 verbatim — same chunk format, same parity tests | Only helps when there are enough chunks (~50+) for parallel merge to outweigh split overhead |
+| K-shard partition is sort-order-preserving → final output is a byte-level concat, no final merge | Per-shard temp subdir + per-chunk writer disposal adds complexity over plain k-way merge |
+| `RLIMIT_NOFILE` queried at startup → K auto-caps to stay within FD budget | Needs multi-core host to shine — on 1–2 cores it degenerates to stream + overhead |
+| Byte-for-byte identical output to stream (CI-verified) | No value on single-chunk inputs — falls back to stream/MMF fast path |
+
 ### Why external merge sort?
 
 For a ~100 GB file that does not fit in memory, external merge sort is the standard approach:
@@ -577,7 +619,7 @@ The codebase follows **SOLID** principles:
 | Principle | Implementation |
 |-----------|---------------|
 | **Single Responsibility** | `ExternalSorter` orchestrates; `ChunkSorter`, `ChunkMerger`, `BinaryChunkReader`, `BinaryChunkWriter` each handle one concern; `TextPool` owns string deduplication; `Utf8LineWriter` owns UTF-8 output formatting; `SizeFormatter` centralizes size formatting; `HardwareProfile` encapsulates diagnostics |
-| **Open/Closed** | `ExternalSorter` and `MmfSorter` implement `IFileSorter` — new strategies added without modifying existing code; new chunk formats implement `IChunkReader` |
+| **Open/Closed** | `ExternalSorter`, `MmfSorter` and `ShardSorter` implement `IFileSorter` — new strategies added without modifying existing code; new chunk formats implement `IChunkReader` |
 | **Liskov Substitution** | All interface implementations honor their contracts |
 | **Interface Segregation** | `IFileSorter` (sort), `IFileGenerator` (generate), `IChunkReader` (read) — each focused on one operation |
 | **Dependency Inversion** | `ChunkMerger` depends on `Func<string, IChunkReader>` factory, not concrete `BinaryChunkReader` |
