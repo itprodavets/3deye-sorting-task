@@ -129,6 +129,9 @@ dotnet run --project src/LargeFileSorter.Sorter -- <input-file> <output-file>
 # Basic — auto-tuned to hardware, no flags needed
 dotnet run --project src/LargeFileSorter.Sorter -- data/test.txt data/sorted.txt
 
+# Release mode for best performance (recommended for large files)
+dotnet run --project src/LargeFileSorter.Sorter -c Release -- data/test.txt data/sorted.txt
+
 # Limit memory — useful if other processes need RAM
 dotnet run --project src/LargeFileSorter.Sorter -- data/test.txt data/sorted.txt \
     --memory 1GB --workers 1
@@ -137,12 +140,34 @@ dotnet run --project src/LargeFileSorter.Sorter -- data/test.txt data/sorted.txt
 dotnet run --project src/LargeFileSorter.Sorter -- data/test.txt data/sorted.txt \
     --buffer 16MB --workers 4 --temp-dir /mnt/nvme/tmp
 
-# Release mode for best performance (recommended for large files)
-dotnet run --project src/LargeFileSorter.Sorter -c Release -- data/test.txt data/sorted.txt
-
-# Force memory-mapped strategy (NativeMemory + MMF, zero managed allocations)
+# Force memory-mapped strategy (NativeMemory + MMF, zero managed allocations) —
+# best when the whole file fits in one chunk
 dotnet run --project src/LargeFileSorter.Sorter -c Release -- data/test.txt data/sorted.txt \
     --strategy mmf
+
+# Force stream strategy (PipeReader + Channel, single-threaded k-way merge) —
+# the workhorse for few chunks
+dotnet run --project src/LargeFileSorter.Sorter -c Release -- data/test.txt data/sorted.txt \
+    --strategy stream
+
+# Force shard strategy (stream Phase 1 + partitioned parallel merge) —
+# best on multi-core for large files with many chunks (~50+)
+dotnet run --project src/LargeFileSorter.Sorter -c Release -- data/test.txt data/sorted.txt \
+    --strategy shard
+
+# Narrow merge width — useful on low-FD systems or to force cascaded merges
+dotnet run --project src/LargeFileSorter.Sorter -c Release -- data/test.txt data/sorted.txt \
+    --merge-width 8
+
+# Fair cross-strategy comparison — pin the total parallelism budget the same way
+dotnet run --project src/LargeFileSorter.Sorter -c Release -- data/test.txt data/sorted.txt \
+    --strategy stream --threads 8
+dotnet run --project src/LargeFileSorter.Sorter -c Release -- data/test.txt data/sorted.txt \
+    --strategy shard  --threads 8
+
+# Tight chunk budget to force multi-chunk path (stress-test the merge)
+dotnet run --project src/LargeFileSorter.Sorter -c Release -- data/test.txt data/sorted.txt \
+    --memory 256MB --strategy stream
 ```
 
 **Example output — auto strategy on 1 GB file (64 GB machine):**
